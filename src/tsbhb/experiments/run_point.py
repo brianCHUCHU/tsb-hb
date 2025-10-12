@@ -97,9 +97,27 @@ def main() -> None:
     # Segmentation (ADI & CV^2)
     feats = compute_adi_cv2(init_set)
     feats["category"] = feats.apply(classify_adi_cv2, axis=1)
-    # Optionally, segmentation-specific metrics can be written separately if needed.
+
+    # Compute RMSSE by category per model (pivot like the notebook)
+    eval_with_cats = merged.merge(feats[["unique_id", "adi", "cv_sq", "category"]], on="unique_id", how="left")
+    categories = [c for c in ["Smooth", "Erratic", "Intermittent", "Lumpy"] if (eval_with_cats["category"] == c).any()]
+    seg_rows = []
+    for model in model_cols:
+        for cat in categories:
+            subset = eval_with_cats[eval_with_cats["category"] == cat][["unique_id", "ds", "y", model]].dropna(subset=[model]).copy()
+            if subset.empty:
+                val = np.nan
+            else:
+                tmp = subset.rename(columns={model: "y_pred"})
+                val = rmsse(init_set, tmp)
+            seg_rows.append({"model": model, "category": cat, "RMSSE": val})
+    seg_df = pd.DataFrame(seg_rows)
+    if not seg_df.empty:
+        pivot = seg_df.pivot(index="model", columns="category", values="RMSSE").reindex(model_cols)
+        # Ensure column order
+        pivot = pivot.reindex(columns=categories)
+        pivot.reset_index().to_csv(out_dir / "segmentation_rmsse.csv", index=False)
 
 
 if __name__ == "__main__":
     main()
-

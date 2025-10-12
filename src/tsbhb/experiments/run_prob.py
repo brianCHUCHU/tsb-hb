@@ -78,9 +78,11 @@ def main() -> None:
             err = dfx["y"] - dfx[col]
             loss = np.maximum(q * err, (q - 1) * err).mean()
             rows.append({"model": model, "quantile": q, "pinball": float(loss)})
-    pd.DataFrame(rows).to_csv(out_dir / "prob_pinball.csv", index=False)
+    pinball_df = pd.DataFrame(rows)
+    # Write both legacy and requested filename variants
+    pinball_df.to_csv(out_dir / "prob_pinball.csv", index=False)
+    pinball_df.to_csv(out_dir / "probabilistic_forecast_pinball_results.csv", index=False)
 
 
 if __name__ == "__main__":
     main()
-

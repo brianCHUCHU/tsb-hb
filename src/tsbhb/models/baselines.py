@@ -76,15 +76,21 @@ def fit_predict_baselines(
         return pd.concat(outputs, ignore_index=True) if outputs else pd.DataFrame()
 
     # Default full baseline set
-    models = [
-        M["CrostonClassic"](),
-        M["CrostonSBA"](),
-        M["TSB"](alpha_d=0.5, alpha_p=0.45),
-        M["ADIDA"](),
-        M["IMAPA"](),
-        M["AutoTheta"](),
-        M["AutoARIMA"](),
-    ]
+    if probabilistic:
+        models = [
+            M["AutoARIMA"](season_length=7),
+            M["AutoTheta"](season_length=7),
+        ]
+    else:
+        models = [
+            M["CrostonClassic"](),
+            M["CrostonSBA"](),
+            M["TSB"](alpha_d=0.5, alpha_p=0.45),
+            M["ADIDA"](),
+            M["IMAPA"](),
+            M["AutoTheta"](),
+            M["AutoARIMA"](),
+        ]
     sf = StatsForecast(models=models, freq=freq, n_jobs=-1)
 
     for uid in uids:

@@ -9,7 +9,13 @@ EPS = 1e-6
 def _read(name):
     root = Path(__file__).resolve().parents[1]
     exp_path = root / "experiments" / "expected" / name
-    out_path = root / "experiments" / "outputs" / name
+    out_dir = root / "experiments" / "outputs"
+    out_path = out_dir / name
+    # Allow alternative filename for pinball results
+    if name == "probabilistic_forecast_pinball_results.csv" and not out_path.exists():
+        alt = out_dir / "prob_pinball.csv"
+        if alt.exists():
+            out_path = alt
     if not exp_path.exists():
         pytest.skip(f"Expected file not found: {exp_path}")
     if not out_path.exists():
@@ -61,4 +67,14 @@ def test_coverage_summary():
 
 def test_pit_values():
     exp, out = _read("pit_values.csv")
+    _assert_frame_close(exp, out)
+
+
+def test_prob_pinball():
+    exp, out = _read("probabilistic_forecast_pinball_results.csv")
+    _assert_frame_close(exp, out)
+
+
+def test_segmentation_rmsse():
+    exp, out = _read("segmentation_rmsse.csv")
     _assert_frame_close(exp, out)

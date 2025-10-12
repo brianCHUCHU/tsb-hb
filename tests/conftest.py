@@ -55,6 +55,43 @@ def _ensure_expected_from_experiment(root: Path) -> None:
         except Exception as e:
             print(f"Warning: cannot convert point metrics: {e}")
 
+    # 3) Segmentation RMSSE pivot from Performance Segmentation Analysis/result.xlsx
+    src_seg_xlsx = legacy / "Performance Segmentation Analysis" / "result.xlsx"
+    dst_seg = exp_dir / "segmentation_rmsse.csv"
+    if src_seg_xlsx.exists() and not dst_seg.exists():
+        try:
+            raw = pd.read_excel(src_seg_xlsx, header=None)
+            # Find 'RMSSE' marker row and the header with categories thereafter
+            rmsse_row = None
+            for i in range(len(raw)):
+                vals = raw.iloc[i].astype(str).tolist()
+                if any("RMSSE" in v for v in vals):
+                    rmsse_row = i
+                    break
+            if rmsse_row is None:
+                raise RuntimeError("Cannot locate RMSSE section in segmentation result.xlsx")
+            # Next rows: header contains category names
+            header_idx = None
+            for j in range(rmsse_row + 1, min(rmsse_row + 10, len(raw))):
+                vals = raw.iloc[j].astype(str).tolist()
+                if any("Smooth" in v for v in vals) and any("Erratic" in v for v in vals):
+                    header_idx = j
+                    break
+            if header_idx is None:
+                raise RuntimeError("Cannot locate RMSSE header row")
+            df = pd.read_excel(src_seg_xlsx, header=header_idx)
+            # first col is model names
+            model_col = df.columns[0]
+            df = df.rename(columns={model_col: "model"})
+            # Keep only wanted columns
+            keep_cols = ["model", "Smooth", "Erratic", "Intermittent", "Lumpy"]
+            exist = [c for c in keep_cols if c in df.columns]
+            df = df[exist]
+            df = df.dropna(subset=["model"]).reset_index(drop=True)
+            df.to_csv(dst_seg, index=False)
+        except Exception as e:
+            print(f"Warning: cannot convert segmentation RMSSE: {e}")
+
 
 @pytest.fixture(scope="session", autouse=True)
 def generate_outputs(tmp_path_factory):
@@ -96,6 +133,8 @@ def generate_outputs(tmp_path_factory):
         "prob_quantiles.csv",
         "coverage_summary.csv",
         "pit_values.csv",
+        "probabilistic_forecast_pinball_results.csv",
+        "segmentation_rmsse.csv",
     ]:
         src = exp_dir / name
         dst = out_dir / name
