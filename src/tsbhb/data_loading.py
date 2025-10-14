@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import random
 
 
 def load_online_retail(path: Path) -> pd.DataFrame:
@@ -50,4 +51,41 @@ def train_eval_split_fixed_origin(df: pd.DataFrame, init_ratio: float = 1.0 / 3,
     init_set = df[init_mask].copy()
     eval_set = df[~init_mask].copy()
     return init_set, eval_set
+
+
+def load_m5_long(sales_path: Path, calendar_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    sales_df = pd.read_csv(sales_path)
+    calendar_df = pd.read_csv(calendar_path)
+    return sales_df, calendar_df
+
+
+def preprocess_m5(
+    sales_df: pd.DataFrame,
+    calendar_df: pd.DataFrame,
+    sample_size: Optional[int] = 5000,
+) -> pd.DataFrame:
+    df = sales_df.copy()
+    cal = calendar_df.copy()
+
+    if "series_id" in df.columns:
+        df = df.rename(columns={"series_id": "id"})
+    if "sales" in df.columns:
+        df = df.rename(columns={"sales": "y"})
+
+    if sample_size is not None and "id" in df.columns:
+        unique_ids = df["id"].dropna().unique().tolist()
+        if sample_size < len(unique_ids):
+            selected = random.sample(unique_ids, sample_size)
+            df = df[df["id"].isin(selected)].copy()
+
+    cal = cal[["d", "date"]].copy()
+    cal["date"] = pd.to_datetime(cal["date"])
+
+    df = df.merge(cal, on="d", how="left")
+    df = df.rename(columns={"id": "unique_id", "date": "ds"})
+    df = df.dropna(subset=["ds"]).copy()
+    df["ds"] = pd.to_datetime(df["ds"])
+
+    df = df[["unique_id", "ds", "y"]].sort_values(["unique_id", "ds"]).reset_index(drop=True)
+    return df
 

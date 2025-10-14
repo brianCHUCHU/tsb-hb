@@ -37,3 +37,11 @@ def default_out_dir() -> Path:
     out.mkdir(parents=True, exist_ok=True)
     return out
 
+
+def default_m5_sales_file() -> Path:
+    return find_repo_root() / "data" / "m5_evaluation_long.csv"
+
+
+def default_m5_calendar_file() -> Path:
+    return find_repo_root() / "data" / "calendar.csv"
+
