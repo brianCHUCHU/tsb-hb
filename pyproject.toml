@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "tsbhb"
 version = "0.1.0"
 description = "TSB-HB supplement code (modularized)"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 
 [tool.setuptools.packages.find]
 where = ["src"]

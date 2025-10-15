@@ -4,11 +4,26 @@ This repository provides a modular, reproducible supplement of the TSB-HB experi
 
 ## Setup
 
-- Create and activate a virtual environment, then install pinned dependencies:
+**Important**: This code requires Python 3.10.x due to Ray and NeuralForecast dependencies.
+
+- Create and activate a Python 3.10 virtual environment:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+# Using conda (recommended)
+conda create -n tsbhb_env python=3.10
+conda activate tsbhb_env
+
+# Or using venv
+python3.10 -m venv .venv && source .venv/bin/activate  # Linux/Mac
+# or
+py -3.10 -m venv .venv && .venv\Scripts\activate  # Windows
+```
+
+- Install pinned dependencies:
+
+```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Data
