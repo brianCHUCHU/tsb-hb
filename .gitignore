@@ -205,3 +205,32 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- TSB-HB project specific ignores ---
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.venv*/
+.env
+.env*/
+.ipynb_checkpoints/
+
+# Data / outputs
+data/*.csv
+data/*.parquet
+experiment/
+experiments/outputs/*
+experiments/tmp/*
+*.log
+
+# Misc
+*.swp
+*.csv
