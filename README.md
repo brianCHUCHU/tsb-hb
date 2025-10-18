@@ -1,30 +1,52 @@
-# TSB-HB Supplement (Modularized)
+# TSB-HB
 
-This repository provides a modular, reproducible supplement of the TSB-HB experiments refactored from `TSBHB_v3.ipynb`.
+Reference implementation for the TSB-HB (Teunter–Syntetos–Babai with hierarchical Bayes shrinkage) demand-forecasting experiments. The code base exposes modular data loading, model components, evaluation utilities, and ready-to-run experiment entry points.
 
-## Setup
+## Quick start
 
-**Important**: This code requires Python 3.10.x due to Ray and NeuralForecast dependencies.
+1. **Install uv** (once per machine):
 
-- Create and activate a Python 3.10 virtual environment:
+	 ```bash
+	 curl -LsSf https://astral.sh/uv/install.sh | sh
+	 ```
 
-```bash
-# Using conda (recommended)
-conda create -n tsbhb_env python=3.10
-conda activate tsbhb_env
+2. **Create the project environment** (Python 3.10) and install the package plus pinned dependencies. A `.venv/` directory will be created automatically next to this README:
 
-# Or using venv
-python3.10 -m venv .venv && source .venv/bin/activate  # Linux/Mac
-# or
-py -3.10 -m venv .venv && .venv\Scripts\activate  # Windows
-```
+	 ```bash
+	 uv sync
+	 ```
 
-- Install pinned dependencies:
+3. *(Optional)* **Enable the DeepAR extras** (required only for `run_deepar.py`):
 
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
+	 ```bash
+	 uv sync --extra deepar
+	 ```
+
+4. **Run any script** directly through uv (no manual activation needed):
+
+	 ```bash
+	 uv run python -m tsbhb.experiments.run_point --help
+	 ```
+
+To work inside the environment interactively, activate the virtualenv created in `.venv/` (`source .venv/bin/activate` on macOS/Linux or `.venv\Scripts\activate` on Windows).
+
+## Dependencies
+
+Core runtime dependencies are pinned in `pyproject.toml`:
+
+| Package | Version | Purpose |
+| --- | --- | --- |
+| `numpy` | 1.26.4 | Vectorised math utilities across the project |
+| `pandas` | 2.3.1 | Data wrangling for loading, preprocessing and evaluation |
+| `scipy` | 1.15.3 | Optimisation routines for the hierarchical Bayes estimator |
+| `statsforecast` | 2.0.2 | Baseline intermittent-demand models (Croston, TSB, AutoARIMA, etc.) |
+| `matplotlib` | 3.10.3 | Shrinkage and PIT diagnostic plots |
+
+Optional extras:
+
+- `deepar`: installs `neuralforecast==3.1.2` and `torch==2.6.0`, which are only needed when you execute `run_deepar.py`.
+
+All transitive packages are resolved automatically by uv during `uv sync`.
 
 ## Data
 
@@ -41,6 +63,8 @@ To run M5 experiments, download the M5 dataset from [Kaggle M5 Forecasting Compe
 3. Place both files in the `data/` directory
 
 The code will **automatically convert** the wide format to long format when loading. No manual preprocessing needed!
+
+### Online Retail Experiments
 
 ```bash
 data/
@@ -66,61 +90,48 @@ python scripts/convert_m5_to_long.py \
     --output data/m5_evaluation_long.csv
 ```
 
-## One‑click Re‑run (examples)
+## Running experiments
 
-Each script supports `--data`, `--out`, and `--seed` (defaults provided).
+Each experiment script lives under `src/tsbhb/experiments/` and can be invoked with uv. Common flags supported by most scripts:
 
-### Online Retail Experiments
+- `--data`: path to the primary dataset (defaults to `data/online_retail.csv`).
+- `--out`: destination directory for metrics/plots (defaults to `outputs/`).
+- `--seed`: random seed for reproducibility (default `42`).
 
-```bash
-python -m tsbhb.experiments.run_point --data data/online_retail.csv
-python -m tsbhb.experiments.run_ablation --data data/online_retail.csv
-python -m tsbhb.experiments.run_grid --data data/online_retail.csv
-python -m tsbhb.experiments.run_prob --data data/online_retail.csv
-python -m tsbhb.experiments.run_coverage_pit --data data/online_retail.csv
-```
-
-### M5 Experiments
+Generic invocation pattern:
 
 ```bash
-# Point forecast on M5 (auto-detects wide/long format)
-python -m tsbhb.experiments.run_point --dataset m5 \
-    --m5-sales data/sales_train_evaluation.csv \
-    --m5-calendar data/calendar.csv \
-    --m5-sample-size 5000
-
-# Or use defaults if files are in data/ directory
-python -m tsbhb.experiments.run_point --dataset m5
+uv run python -m tsbhb.experiments.<script_name> [options]
 ```
 
-## Tests
+### Script catalog
 
-Before running tests, generate expected “truth” outputs once by executing the original `TSBHB_v3.ipynb` and saving the following CSVs into `experiments/expected/`:
-
-- `point_metrics.csv`
-- `ablation_metrics.csv`
-- `grid_summary.csv`
-- `prob_quantiles.csv`
-- `coverage_summary.csv`
-- `pit_values.csv`
-
-Then run:
-
-```bash
-pytest -q
-```
-
-Tests will run the refactored entrypoints to produce `experiments/outputs/*.csv` and compare to `experiments/expected/*.csv`.
-
-## Deep Learning Benchmark
-
-Implement `DLBenchmark` in `src/tsbhb/models/dl_benchmark.py` by providing `fit()` and `predict()` (optionally probabilistic via quantiles). Extend `run_point.py` / `run_prob.py` with a `--model dl` branch to enable it. Add any extra packages to `requirements.txt` as needed.
+- `run_point.py`
+	- **Purpose:** Fits the TSB-HB model and a suite of StatsForecast baselines for point forecasts.
+	- **Datasets:** Online Retail (default) and M5 via `--dataset m5`.
+	- **Highlights:** Generates `point_metrics.csv`, shrinkage plots (`fig_shrink_p.png`, `fig_shrink_size.png`), and `point_metrics_m5.csv` when running on M5.
+- `run_prob.py`
+	- **Purpose:** Produces probabilistic forecasts (quantiles) for TSB-HB and AutoARIMA/AutoTheta baselines.
+	- **Datasets:** Online Retail only (M5 support not implemented).
+	- **Outputs:** `prob_quantiles.csv`, `prob_pinball.csv`, and `probabilistic_forecast_pinball_results.csv` in the chosen `--out` directory.
+- `run_grid.py`
+	- **Purpose:** Sweeps across `(alpha_d, alpha_p)` combinations for the TSB baseline to compare against the TSB-HB reference.
+	- **Datasets:** Online Retail only.
+	- **Outputs:** `grid_summary.csv` summarising ME/MAE/RMSE/RMSSE for each grid point.
+- `run_ablation.py`
+	- **Purpose:** Compares different shrinkage/likelihood variants (HB LogNormal, MLE LogNormal, HB Gamma) to quantify each modelling choice.
+	- **Datasets:** Online Retail only.
+	- **Outputs:** `ablation_metrics.csv` with ME/MAE/RMSE/RMSSE per variant.
+- `run_coverage_pit.py`
+	- **Purpose:** Evaluates interval coverage and probability integral transform statistics for probabilistic forecasts.
+	- **Datasets:** Online Retail only.
+	- **Outputs:** `coverage_summary.csv` (coverage & interval widths) and `pit_values.csv` for histogram diagnostics.
+- `run_deepar.py`
+	- **Purpose:** Optional neural benchmark using `neuralforecast`’s AutoDeepAR across configurable horizons.
+	- **Datasets:** Online Retail only (subset sampling controlled via CLI flags).
+	- **Requirements:** Install extras via `uv sync --extra deepar`. Produces `multi_horizon_comparison_results.csv` with ME/MAE/RMSE/RMSSE per horizon and model.
 
 ## Outputs
 
-- `run_point.py`: writes `experiments/outputs/point_metrics.csv` and shrinkage plots `fig_shrink_p.png`, `fig_shrink_size.png`.
-- `run_ablation.py`: writes `experiments/outputs/ablation_metrics.csv`.
-- `run_grid.py`: writes `experiments/outputs/grid_summary.csv`.
-- `run_prob.py`: writes `experiments/outputs/prob_quantiles.csv` and `experiments/outputs/prob_pinball.csv`.
-- `run_coverage_pit.py`: writes `experiments/outputs/coverage_summary.csv` and `experiments/outputs/pit_values.csv`.
+By default, each experiment writes results, diagnostics, and plots into `outputs/`. Clean the directory between runs if you need a fresh slate, or override `--out` with a dedicated subdirectory for reproducibility.
 
