@@ -64,6 +64,8 @@ To run M5 experiments, download the M5 dataset from [Kaggle M5 Forecasting Compe
 
 The code will **automatically convert** the wide format to long format when loading. No manual preprocessing needed!
 
+### Online Retail Experiments
+
 ```bash
 data/
   ├── Online_Retail.csv

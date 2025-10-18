@@ -53,9 +53,79 @@ def train_eval_split_fixed_origin(df: pd.DataFrame, init_ratio: float = 1.0 / 3,
     return init_set, eval_set
 
 
+def convert_m5_wide_to_long(sales_wide_path: Path, output_path: Optional[Path] = None) -> pd.DataFrame:
+    """Convert M5 wide format (sales_train_evaluation.csv) to long format.
+    
+    Args:
+        sales_wide_path: Path to sales_train_evaluation.csv or sales_train_validation.csv
+        output_path: Optional path to save the long format CSV
+        
+    Returns:
+        DataFrame in long format with columns: [series_id, item_id, store_id, d, sales]
+    """
+    # Read wide format data
+    df_wide = pd.read_csv(sales_wide_path)
+    
+    # Extract metadata columns
+    id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
+    meta_cols = [c for c in id_cols if c in df_wide.columns]
+    
+    # Find all day columns (d_1, d_2, ..., d_1941, etc.)
+    day_cols = [c for c in df_wide.columns if c.startswith('d_')]
+    
+    # Melt to long format
+    df_long = df_wide.melt(
+        id_vars=meta_cols,
+        value_vars=day_cols,
+        var_name='d',
+        value_name='sales'
+    )
+    
+    # Create series_id if not exists (combination of item and store)
+    if 'id' in df_long.columns:
+        df_long = df_long.rename(columns={'id': 'series_id'})
+    elif 'item_id' in df_long.columns and 'store_id' in df_long.columns:
+        df_long['series_id'] = df_long['item_id'] + '_' + df_long['store_id']
+    
+    # Select and order columns
+    output_cols = ['series_id', 'item_id', 'store_id', 'd', 'sales']
+    output_cols = [c for c in output_cols if c in df_long.columns]
+    df_long = df_long[output_cols].copy()
+    
+    # Sort by series and day
+    df_long = df_long.sort_values(['series_id', 'd']).reset_index(drop=True)
+    
+    # Optionally save to file
+    if output_path is not None:
+        df_long.to_csv(output_path, index=False)
+        print(f"Long format data saved to: {output_path}")
+    
+    return df_long
+
+
 def load_m5_long(sales_path: Path, calendar_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    sales_df = pd.read_csv(sales_path)
+    """Load M5 data in long format.
+    
+    If sales_path is a wide format file (contains d_1, d_2, etc. columns),
+    it will be automatically converted to long format.
+    """
     calendar_df = pd.read_csv(calendar_path)
+    
+    # Try to read and detect format
+    sales_df = pd.read_csv(sales_path, nrows=0)  # Read only header
+    
+    # Check if it's wide format (has d_1, d_2, etc. columns)
+    day_cols = [c for c in sales_df.columns if c.startswith('d_') and c[2:].isdigit()]
+    
+    if len(day_cols) > 0:
+        # Wide format detected, convert to long
+        print(f"Wide format detected. Converting {sales_path} to long format...")
+        sales_df = convert_m5_wide_to_long(sales_path)
+        print(f"Conversion complete. Shape: {sales_df.shape}")
+    else:
+        # Already in long format
+        sales_df = pd.read_csv(sales_path)
+    
     return sales_df, calendar_df
 
 
