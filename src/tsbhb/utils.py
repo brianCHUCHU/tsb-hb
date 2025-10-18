@@ -39,9 +39,25 @@ def default_out_dir() -> Path:
 
 
 def default_m5_sales_file() -> Path:
-    return find_repo_root() / "data" / "m5_evaluation_long.csv"
+    """Default path for M5 sales file (long format preferred, wide format auto-converted)."""
+    root = find_repo_root() / "data"
+    # Try long format first
+    long_path = root / "m5_evaluation_long.csv"
+    if long_path.exists():
+        return long_path
+    # Fall back to wide format (will be auto-converted)
+    wide_path = root / "sales_train_evaluation.csv"
+    if wide_path.exists():
+        return wide_path
+    # Return long format path as default (even if doesn't exist)
+    return long_path
 
 
 def default_m5_calendar_file() -> Path:
     return find_repo_root() / "data" / "calendar.csv"
+
+
+def default_m5_wide_file() -> Path:
+    """Default path for M5 wide format sales file."""
+    return find_repo_root() / "data" / "sales_train_evaluation.csv"
 

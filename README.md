@@ -28,11 +28,49 @@ pip install -e .
 
 ## Data
 
+### Online Retail Dataset
+
 - Place the Online Retail dataset at `data/online_retail.csv`.
+
+### M5 Dataset (Optional)
+
+To run M5 experiments, download the M5 dataset from [Kaggle M5 Forecasting Competition](https://www.kaggle.com/c/m5-forecasting-accuracy/data):
+
+1. Download `sales_train_evaluation.csv` (or `sales_train_validation.csv`)
+2. Download `calendar.csv`
+3. Place both files in the `data/` directory
+
+The code will **automatically convert** the wide format to long format when loading. No manual preprocessing needed!
+
+```bash
+data/
+  ├── Online_Retail.csv
+  ├── sales_train_evaluation.csv  # M5 wide format (auto-converted)
+  └── calendar.csv                 # M5 calendar
+```
+
+Alternatively, if you already have the long format data:
+```bash
+data/
+  ├── m5_evaluation_long.csv       # M5 long format (preferred)
+  └── calendar.csv
+```
+
+**Optional: Pre-convert to long format**
+
+If you want to pre-convert the data (recommended for faster repeated loading):
+
+```bash
+python scripts/convert_m5_to_long.py \
+    --input data/sales_train_evaluation.csv \
+    --output data/m5_evaluation_long.csv
+```
 
 ## One‑click Re‑run (examples)
 
 Each script supports `--data`, `--out`, and `--seed` (defaults provided).
+
+### Online Retail Experiments
 
 ```bash
 python -m tsbhb.experiments.run_point --data data/online_retail.csv
@@ -40,6 +78,19 @@ python -m tsbhb.experiments.run_ablation --data data/online_retail.csv
 python -m tsbhb.experiments.run_grid --data data/online_retail.csv
 python -m tsbhb.experiments.run_prob --data data/online_retail.csv
 python -m tsbhb.experiments.run_coverage_pit --data data/online_retail.csv
+```
+
+### M5 Experiments
+
+```bash
+# Point forecast on M5 (auto-detects wide/long format)
+python -m tsbhb.experiments.run_point --dataset m5 \
+    --m5-sales data/sales_train_evaluation.csv \
+    --m5-calendar data/calendar.csv \
+    --m5-sample-size 5000
+
+# Or use defaults if files are in data/ directory
+python -m tsbhb.experiments.run_point --dataset m5
 ```
 
 ## Tests
