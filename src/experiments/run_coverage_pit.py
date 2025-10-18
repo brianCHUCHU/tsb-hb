@@ -6,11 +6,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from tsbhb.utils import set_seed, default_data_file, default_out_dir
-from tsbhb.data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
-from tsbhb.models.tsb_hb import fit_tsb_hb, predict_tsb_hb
-from tsbhb.models.baselines import fit_predict_baselines
-from tsbhb.metrics import coverage_rate, pit_values
+from utils import set_seed, default_data_file, default_out_dir
+from data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
+from models.tsb_hb import fit_tsb_hb, predict_tsb_hb
+from models.baselines import fit_predict_baselines
+from metrics import coverage_rate, pit_values
 
 
 def main() -> None:

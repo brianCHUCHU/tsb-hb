@@ -24,3 +24,11 @@ deepar = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools]
+py-modules = [
+	"data_loading",
+	"metrics",
+	"plotting",
+	"utils",
+]
+

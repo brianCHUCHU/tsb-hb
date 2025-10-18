@@ -17,7 +17,7 @@ def set_seed(seed: int = 42) -> None:
 def find_repo_root(start: Optional[Path] = None) -> Path:
     """Find project root by walking up until `pyproject.toml` is found.
 
-    Fallback: use 3 parents up from this file (src/tsbhb/...).
+    Fallback: use 3 parents up from this file (src/...).
     """
     if start is None:
         start = Path(__file__).resolve()
@@ -29,7 +29,14 @@ def find_repo_root(start: Optional[Path] = None) -> Path:
 
 
 def default_data_file() -> Path:
-    return find_repo_root() / "data" / "online_retail.csv"
+    root = find_repo_root() / "data"
+    lower = root / "online_retail.csv"
+    upper = root / "Online_Retail.csv"
+    if lower.exists():
+        return lower
+    if upper.exists():
+        return upper
+    return lower
 
 
 def default_out_dir() -> Path:

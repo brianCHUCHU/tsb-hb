@@ -1,6 +1,6 @@
 # TSB-HB
 
-Reference implementation for the TSB-HB (Teunter–Syntetos–Babai with hierarchical Bayes shrinkage) demand-forecasting experiments. The code base exposes modular data loading, model components, evaluation utilities, and ready-to-run experiment entry points.
+Reference implementation for the TSB-HB (Teunter–Syntetos–Babai with hierarchical Bayes shrinkage) demand-forecasting experiments. The project uses a flattened `src/` layout: helper modules sit at the top level (`data_loading.py`, `metrics.py`, `plotting.py`, `utils.py`) alongside subpackages (`models/`, `experiments/`, `tools/`). Packaging metadata lives under `src/tsbhb.egg-info/` because the distribution name remains `tsbhb`.
 
 ## Quick start
 
@@ -25,34 +25,16 @@ Reference implementation for the TSB-HB (Teunter–Syntetos–Babai with hierarc
 4. **Run any script** directly through uv (no manual activation needed):
 
 	 ```bash
-	 uv run python -m tsbhb.experiments.run_point --help
+	 uv run python -m experiments.run_point --help
 	 ```
 
-To work inside the environment interactively, activate the virtualenv created in `.venv/` (`source .venv/bin/activate` on macOS/Linux or `.venv\Scripts\activate` on Windows).
-
-## Dependencies
-
-Core runtime dependencies are pinned in `pyproject.toml`:
-
-| Package | Version | Purpose |
-| --- | --- | --- |
-| `numpy` | 1.26.4 | Vectorised math utilities across the project |
-| `pandas` | 2.3.1 | Data wrangling for loading, preprocessing and evaluation |
-| `scipy` | 1.15.3 | Optimisation routines for the hierarchical Bayes estimator |
-| `statsforecast` | 2.0.2 | Baseline intermittent-demand models (Croston, TSB, AutoARIMA, etc.) |
-| `matplotlib` | 3.10.3 | Shrinkage and PIT diagnostic plots |
-
-Optional extras:
-
-- `deepar`: installs `neuralforecast==3.1.2` and `torch==2.6.0`, which are only needed when you execute `run_deepar.py`.
-
-All transitive packages are resolved automatically by uv during `uv sync`.
+To work inside the environment interactively, activate the virtualenv created in `.venv/` (`source .venv/bin/activate` on macOS/Linux or `.venv\Scripts\activate` on Windows). With the flattened layout, you can import modules directly (e.g. `import data_loading`, `from models.tsb_hb import fit_tsb_hb`).
 
 ## Data
 
 ### Online Retail Dataset
 
-- Place the Online Retail dataset at `data/online_retail.csv`.
+- Place the data at `data/online_retail.csv`. The loader also accepts the legacy name `Online_Retail.csv`.
 
 ### M5 Dataset (Optional)
 
@@ -62,37 +44,28 @@ To run M5 experiments, download the M5 dataset from [Kaggle M5 Forecasting Compe
 2. Download `calendar.csv`
 3. Place both files in the `data/` directory
 
-The code will **automatically convert** the wide format to long format when loading. No manual preprocessing needed!
-
-### Online Retail Experiments
+The loader automatically detects the wide format and converts it on the fly—no preprocessing required. Your `data/` directory should look like:
 
 ```bash
 data/
-  ├── Online_Retail.csv
-  ├── sales_train_evaluation.csv  # M5 wide format (auto-converted)
-  └── calendar.csv                 # M5 calendar
+	├── online_retail.csv    # or Online_Retail.csv
+	├── sales_train_evaluation.csv  # M5 wide format (auto-converted)
+	└── calendar.csv                # M5 calendar metadata
 ```
 
-Alternatively, if you already have the long format data:
-```bash
-data/
-  ├── m5_evaluation_long.csv       # M5 long format (preferred)
-  └── calendar.csv
-```
-
-**Optional: Pre-convert to long format**
-
-If you want to pre-convert the data (recommended for faster repeated loading):
+**Optional caching:** If you prefer to materialise the long-format file once (to speed up repeated experiments), use the in-package helper:
 
 ```bash
-python scripts/convert_m5_to_long.py \
-    --input data/sales_train_evaluation.csv \
-    --output data/m5_evaluation_long.csv
+uv run python -m tools.convert_m5_to_long \
+		--input data/sales_train_evaluation.csv \
+		--output data/m5_evaluation_long.csv
 ```
+
+You can then pass the cached file explicitly with `--m5-sales data/m5_evaluation_long.csv` when invoking scripts.
 
 ## Running experiments
 
-Each experiment script lives under `src/tsbhb/experiments/` and can be invoked with uv. Common flags supported by most scripts:
+Each experiment script lives under `src/experiments/` and can be invoked with uv. Common flags supported by most scripts:
 
 - `--data`: path to the primary dataset (defaults to `data/online_retail.csv`).
 - `--out`: destination directory for metrics/plots (defaults to `outputs/`).
@@ -101,7 +74,7 @@ Each experiment script lives under `src/tsbhb/experiments/` and can be invoked w
 Generic invocation pattern:
 
 ```bash
-uv run python -m tsbhb.experiments.<script_name> [options]
+uv run python -m experiments.<script_name> [options]
 ```
 
 ### Script catalog

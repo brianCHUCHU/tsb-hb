@@ -6,24 +6,24 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from tsbhb.utils import (
+from utils import (
     set_seed,
     default_data_file,
     default_out_dir,
     default_m5_sales_file,
     default_m5_calendar_file,
 )
-from tsbhb.data_loading import (
+from data_loading import (
     load_online_retail,
     preprocess_online_retail,
     train_eval_split_fixed_origin,
     load_m5_long,
     preprocess_m5,
 )
-from tsbhb.models.tsb_hb import fit_tsb_hb, predict_tsb_hb
-from tsbhb.models.baselines import fit_predict_baselines
-from tsbhb.metrics import me, mae, rmse, rmsse, compute_adi_cv2, classify_adi_cv2
-from tsbhb.plotting import plot_shrinkage_scatter
+from models.tsb_hb import fit_tsb_hb, predict_tsb_hb
+from models.baselines import fit_predict_baselines
+from metrics import me, mae, rmse, rmsse, compute_adi_cv2, classify_adi_cv2
+from plotting import plot_shrinkage_scatter
 
 
 def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
