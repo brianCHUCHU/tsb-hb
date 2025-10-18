@@ -48,7 +48,6 @@ coverage.xml
 *.cover
 *.py.cover
 .hypothesis/
-.pytest_cache/
 cover/
 
 # Translations
@@ -222,13 +221,13 @@ __pycache__/
 .env
 .env*/
 .ipynb_checkpoints/
+uv.lock
 
 # Data / outputs
 data/*.csv
 data/*.parquet
 experiment/
-experiments/outputs/*
-experiments/tmp/*
+outputs/*
 *.log
 
 # Misc

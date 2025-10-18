@@ -7,6 +7,19 @@ name = "tsbhb"
 version = "0.1.0"
 description = "TSB-HB supplement code (modularized)"
 requires-python = ">=3.10,<3.11"
+dependencies = [
+	"numpy==1.26.4",
+	"pandas==2.3.1",
+	"scipy==1.15.3",
+	"statsforecast==2.0.2",
+	"matplotlib==3.10.3",
+]
+
+[project.optional-dependencies]
+deepar = [
+	"neuralforecast==3.1.2",
+	"torch==2.6.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

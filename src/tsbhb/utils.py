@@ -33,7 +33,7 @@ def default_data_file() -> Path:
 
 
 def default_out_dir() -> Path:
-    out = find_repo_root() / "experiments" / "outputs"
+    out = find_repo_root() / "outputs"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
