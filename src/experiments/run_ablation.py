@@ -6,10 +6,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from tsbhb.utils import set_seed, default_data_file, default_out_dir
-from tsbhb.data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
-from tsbhb.models.tsb_hb import fit_tsb_hb
-from tsbhb.metrics import me, mae, rmse, rmsse
+from utils import set_seed, default_data_file, default_out_dir
+from data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
+from models.tsb_hb import fit_tsb_hb
+from metrics import me, mae, rmse, rmsse
 
 
 def main() -> None:

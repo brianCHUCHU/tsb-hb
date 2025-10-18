@@ -222,6 +222,7 @@ __pycache__/
 .env*/
 .ipynb_checkpoints/
 uv.lock
+requirements*.txt
 
 # Data / outputs
 data/*.csv

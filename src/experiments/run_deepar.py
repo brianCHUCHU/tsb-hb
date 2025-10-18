@@ -7,10 +7,10 @@ from typing import List
 import numpy as np
 import pandas as pd
 
-from tsbhb.utils import set_seed, default_data_file, default_out_dir
-from tsbhb.data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
-from tsbhb.metrics import me, mae, rmse, rmsse
-from tsbhb.models.tsb_hb import fit_tsb_hb, predict_tsb_hb
+from utils import set_seed, default_data_file, default_out_dir
+from data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
+from metrics import me, mae, rmse, rmsse
+from models.tsb_hb import fit_tsb_hb, predict_tsb_hb
 
 
 def _compute_rmsse_denominator(init_set: pd.DataFrame) -> pd.Series:
