@@ -34,9 +34,11 @@ To work inside the environment interactively, activate the virtualenv created in
 
 ### Online Retail Dataset
 
+Download the Online Retail Dataset from [UCI Machine Learning Repository](https://archive.ics.uci.edu/dataset/352/online+retail)
+
 - Place the data at `data/online_retail.csv`. The loader also accepts the legacy name `Online_Retail.csv`.
 
-### M5 Dataset (Optional)
+### M5 Dataset
 
 To run M5 experiments, download the M5 dataset from [Kaggle M5 Forecasting Competition](https://www.kaggle.com/c/m5-forecasting-accuracy/data):
 
@@ -108,3 +110,17 @@ uv run python -m experiments.<script_name> [options]
 
 By default, each experiment writes results, diagnostics, and plots into `outputs/`. Clean the directory between runs if you need a fresh slate, or override `--out` with a dedicated subdirectory for reproducibility.
 
+## Reference
+
+1. Azul Garza, Max Mergenthaler Canseco, Cristian Challú, & Kin G. Olivares.  
+   **StatsForecast: Lightning fast forecasting with statistical and econometric models.**  
+   PyCon Salt Lake City, Utah, US, 2022.  
+   [https://github.com/Nixtla/statsforecast](https://github.com/Nixtla/statsforecast)
+
+2. Addison Howard, inversion, Spyros Makridakis, & Vangelis.  
+   **M5 Forecasting – Accuracy.** Kaggle, 2020.  
+   [https://kaggle.com/competitions/m5-forecasting-accuracy](https://kaggle.com/competitions/m5-forecasting-accuracy)
+
+3. Daqing Chen.  
+   **Online Retail.** UCI Machine Learning Repository, 2015.  
+   DOI: [10.24432/C5BW33](https://doi.org/10.24432/C5BW33)
