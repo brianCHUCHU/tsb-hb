@@ -9,7 +9,7 @@ import pandas as pd
 from utils import set_seed, default_data_file, default_out_dir
 from data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
 from models.tsb_hb import fit_tsb_hb
-from metrics import me, mae, rmse, rmsse
+from metrics import me, mae, rmse, rmsse, wrmsse
 
 
 def main() -> None:
@@ -79,6 +79,7 @@ def main() -> None:
             "MAE": mae(tmp["y"].values, tmp["y_pred"].values),
             "RMSE": rmse(tmp["y"].values, tmp["y_pred"].values),
             "RMSSE": rmsse(init_set, tmp),
+            "WRMSSE": wrmsse(init_set, tmp),
         })
 
     pd.DataFrame(results).to_csv(out_dir / "ablation_metrics.csv", index=False)

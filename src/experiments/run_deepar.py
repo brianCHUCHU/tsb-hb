@@ -9,7 +9,7 @@ import pandas as pd
 
 from utils import set_seed, default_data_file, default_out_dir
 from data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
-from metrics import me, mae, rmse, rmsse
+from metrics import me, mae, rmse, rmsse, wrmsse
 from models.tsb_hb import fit_tsb_hb, predict_tsb_hb
 
 
@@ -114,6 +114,7 @@ def main() -> None:
                 "RMSE": rmse(tmp["y"].to_numpy(), tmp["y_pred"].to_numpy()),
                 # Global RMSSE across series using shared denominator definition
                 "RMSSE": rmsse(init_set, tmp),
+                "WRMSSE": wrmsse(init_set, tmp),
             })
 
     if results:
