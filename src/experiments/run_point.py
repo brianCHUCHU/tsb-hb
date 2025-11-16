@@ -22,7 +22,7 @@ from data_loading import (
 )
 from models.tsb_hb import fit_tsb_hb, predict_tsb_hb
 from models.baselines import fit_predict_baselines
-from metrics import me, mae, rmse, rmsse, compute_adi_cv2, classify_adi_cv2
+from metrics import me, mae, rmse, rmsse, wrmsse, compute_adi_cv2, classify_adi_cv2
 from plotting import plot_shrinkage_scatter
 
 
@@ -78,6 +78,7 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
             "MAE": mae(tmp["y"].to_numpy(), tmp["y_pred"].to_numpy()),
             "RMSE": rmse(tmp["y"].to_numpy(), tmp["y_pred"].to_numpy()),
             "RMSSE": rmsse(init_set, tmp),
+            "WRMSSE": wrmsse(init_set, tmp),
         })
 
     metrics_df = pd.DataFrame(results)
@@ -86,7 +87,7 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
 
     if not metrics_df.empty:
         print("=== M5 Point Forecast Metrics ===")
-        print(metrics_df.sort_values("RMSSE"))
+        print(metrics_df.sort_values("WRMSSE"))
 
 
 def main() -> None:
@@ -140,6 +141,7 @@ def main() -> None:
             "MAE": mae(tmp["y"].values, tmp["y_pred"].values),
             "RMSE": rmse(tmp["y"].values, tmp["y_pred"].values),
             "RMSSE": rmsse(init_set, tmp),
+            "WRMSSE": wrmsse(init_set, tmp),
         })
     point_df = pd.DataFrame(results)
     point_df.to_csv(out_dir / "point_metrics.csv", index=False)
@@ -189,16 +191,21 @@ def main() -> None:
         for cat in categories:
             subset = eval_with_cats[eval_with_cats["category"] == cat][["unique_id", "ds", "y", model]].dropna(subset=[model]).copy()
             if subset.empty:
-                val = np.nan
+                val_r = np.nan
+                val_wr = np.nan
             else:
                 tmp = subset.rename(columns={model: "y_pred"})
-                val = rmsse(init_set, tmp)
-            seg_rows.append({"model": model, "category": cat, "RMSSE": val})
+                val_r = rmsse(init_set, tmp)
+                val_wr = wrmsse(init_set, tmp)
+            seg_rows.append({"model": model, "category": cat, "Metric": "RMSSE", "Value": val_r})
+            seg_rows.append({"model": model, "category": cat, "Metric": "WRMSSE", "Value": val_wr})
     seg_df = pd.DataFrame(seg_rows)
     if not seg_df.empty:
-        pivot = seg_df.pivot(index="model", columns="category", values="RMSSE").reindex(model_cols)
-        # Ensure column order
-        pivot = pivot.reindex(columns=categories)
+        pivot = seg_df.pivot_table(index="model", columns=["Metric", "category"], values="Value")
+        pivot = pivot.reindex(model_cols)
+        # Flatten columns with Metric prefix
+        pivot.columns = [f"{cat}_{metric}" for metric, cat in pivot.columns]
+        pivot = pivot.reindex(columns=[f"{cat}_RMSSE" for cat in categories] + [f"{cat}_WRMSSE" for cat in categories if f"{cat}_WRMSSE" in pivot.columns])
         pivot.reset_index().to_csv(out_dir / "segmentation_rmsse.csv", index=False)
 
 

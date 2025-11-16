@@ -18,29 +18,85 @@ def rmse(y: np.ndarray, yhat: np.ndarray) -> float:
     return float(np.sqrt(np.nanmean((yhat - y) ** 2)))
 
 
+def _per_series_naive_mse(init_set: pd.DataFrame, y_col: str = "y") -> pd.Series:
+    init_sorted = init_set.sort_values(["unique_id", "ds"]).copy()
+    init_sorted["y_lag1"] = init_sorted.groupby("unique_id")[y_col].shift(1)
+    init_sorted["naive_sq_err"] = (init_sorted[y_col] - init_sorted["y_lag1"]) ** 2
+    epsilon = 1e-9
+    return init_sorted.groupby("unique_id")["naive_sq_err"].mean().where(lambda s: s > 0, epsilon)
+
+
+def _per_series_model_mse(
+    eval_df: pd.DataFrame,
+    y_col: str = "y",
+    yhat_col: str = "y_pred",
+) -> pd.Series:
+    tmp = eval_df[["unique_id", y_col, yhat_col]].dropna().copy()
+    tmp["model_sq_err"] = (tmp[y_col] - tmp[yhat_col]) ** 2
+    return tmp.groupby("unique_id")["model_sq_err"].mean()
+
+
+def _prepare_rmsse_frame(
+    init_set: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    y_col: str = "y",
+    yhat_col: str = "y_pred",
+) -> pd.DataFrame:
+    denom = _per_series_naive_mse(init_set, y_col=y_col)
+    mse_per_series = _per_series_model_mse(eval_df, y_col=y_col, yhat_col=yhat_col)
+    series_eval = pd.concat([
+        mse_per_series.rename("model_mse"),
+        denom.rename("rmsse_denom"),
+    ], axis=1)
+    series_eval = series_eval.dropna(subset=["model_mse", "rmsse_denom"])
+    if series_eval.empty:
+        return series_eval
+    series_eval["scaled_err_sq"] = series_eval["model_mse"] / series_eval["rmsse_denom"]
+    return series_eval
+
+
 def rmsse(
     init_set: pd.DataFrame,
     eval_df: pd.DataFrame,
     y_col: str = "y",
     yhat_col: str = "y_pred",
 ) -> float:
-    # Denominator: mean squared naive error on training (lag-1)
-    init_sorted = init_set.sort_values(["unique_id", "ds"]).copy()
-    init_sorted["y_lag1"] = init_sorted.groupby("unique_id")[y_col].shift(1)
-    init_sorted["naive_sq_err"] = (init_sorted[y_col] - init_sorted["y_lag1"]) ** 2
-    epsilon = 1e-9
-    denom = init_sorted.groupby("unique_id")["naive_sq_err"].mean().where(lambda s: s > 0, epsilon)
-
-    # Numerator per-series MSE on evaluation
-    tmp = eval_df[["unique_id", y_col, yhat_col]].dropna().copy()
-    tmp["model_sq_err"] = (tmp[y_col] - tmp[yhat_col]) ** 2
-    mse_per_series = tmp.groupby("unique_id")["model_sq_err"].mean()
-    series_eval = pd.concat([
-        mse_per_series.rename("model_mse"),
-        denom.rename("rmsse_denom"),
-    ], axis=1)
-    series_eval["scaled_err_sq"] = series_eval["model_mse"] / series_eval["rmsse_denom"]
+    series_eval = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
+    if series_eval.empty:
+        return float("nan")
     return float(np.sqrt(np.nanmean(series_eval["scaled_err_sq"])) )
+
+
+def wrmsse(
+    init_set: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    weights: pd.Series | None = None,
+    y_col: str = "y",
+    yhat_col: str = "y_pred",
+) -> float:
+    """Weighted RMSSE using per-series demand weights.
+
+    Weights default to the share of total demand in ``init_set``.
+    """
+
+    series_eval = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
+    if series_eval.empty:
+        return float("nan")
+
+    if weights is None:
+        weights = init_set.groupby("unique_id")[y_col].sum()
+    if not isinstance(weights, pd.Series):
+        weights = pd.Series(weights)
+
+    weights = weights.reindex(series_eval.index).fillna(0.0)
+    total_weight = float(weights.sum())
+    if total_weight <= 0:
+        weights = pd.Series(1.0, index=series_eval.index)
+        total_weight = float(weights.sum())
+    norm_weights = weights / total_weight
+
+    weighted_scaled_err = series_eval["scaled_err_sq"] * norm_weights
+    return float(np.sqrt(np.nansum(weighted_scaled_err)))
 
 
 def coverage_rate(df: pd.DataFrame, lower_q: float, upper_q: float, alpha: float) -> Dict[str, float]:
