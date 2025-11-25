@@ -34,7 +34,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--min-len", type=int, default=30)
     ap.add_argument("--init-ratio", type=float, default=1.0 / 3.0)
-    ap.add_argument("--horizons", type=str, default="14")
+    ap.add_argument("--horizons", type=str, default="10")
     ap.add_argument("--max-series", type=int, default=100)
     ap.add_argument("--num-samples", type=int, default=10)
     ap.add_argument("--cpus", type=int, default=4)
@@ -50,7 +50,7 @@ def main() -> None:
 
     # Ensure minimum history and sufficient eval length for max horizon
     horizons = _parse_horizons(args.horizons)
-    max_h = max(horizons) if horizons else 14
+    max_h = max(horizons) if horizons else 10
     df["t"] = df.groupby("unique_id").cumcount()
     df["L"] = df.groupby("unique_id")["t"].transform("max") + 1
     df = df[(df["L"] >= args.min_len) & (df["L"] * (1 - args.init_ratio) >= max_h)].copy()
@@ -74,7 +74,7 @@ def main() -> None:
 
     # Lazy import heavy deps
     from neuralforecast import NeuralForecast
-    from neuralforecast.auto import AutoDeepAR
+    from neuralforecast.auto import AutoDeepAR, DeepAR
     from neuralforecast.losses.pytorch import DistributionLoss
 
     results: list[dict] = []
@@ -90,6 +90,8 @@ def main() -> None:
                 cpus=args.cpus,
             )
         ]
+
+
         nf = NeuralForecast(models=models, freq="D")
         nf.fit(df=init_set[["unique_id", "ds", "y"]])
 

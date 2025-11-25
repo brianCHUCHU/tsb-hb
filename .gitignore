@@ -230,6 +230,7 @@ data/*.parquet
 experiment/
 outputs/*
 *.log
+lightning_logs/
 
 # Misc
 *.swp
