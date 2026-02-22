@@ -131,7 +131,7 @@ def compute_adi_cv2(init_set: pd.DataFrame) -> pd.DataFrame:
     demand_events = init_set[init_set["y"] > 0]
     series_stats = demand_events.groupby("unique_id")["y"].agg(["mean", "std"]).reset_index()
     series_stats["cv_sq"] = (series_stats["std"] / series_stats["mean"]) ** 2
-    series_stats["cv_sq"].fillna(0, inplace=True)
+    series_stats["cv_sq"] = series_stats["cv_sq"].fillna(0)
 
     # ADI from counts on init set
     g_init = init_set.copy()

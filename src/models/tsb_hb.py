@@ -154,7 +154,7 @@ def predict_tsb_hb(
         mean_pred = (params.p_posterior * size_mean).fillna(0.0)
         out = eval_df[["unique_id", "ds"]].copy()
         out["yhat"] = out["unique_id"].map(mean_pred)
-        out["yhat"].fillna(0.0, inplace=True)
+        out["yhat"] = out["yhat"].fillna(0.0)
         return out
 
     # Probabilistic via Monte Carlo following the notebook
@@ -174,6 +174,7 @@ def predict_tsb_hb(
         size_samples = np.exp(log_samples)
         samples = size_samples * demand_occurs
         qvals = {f"q_{q}": float(np.quantile(samples, q)) for q in quantiles}
+        qvals["prob_zero_predicted"] = 1.0 - p
 
         ds_vals = eval_df.loc[eval_df["unique_id"] == uid, "ds"].values
         tmp = pd.DataFrame({**qvals, "unique_id": uid, "ds": ds_vals})
