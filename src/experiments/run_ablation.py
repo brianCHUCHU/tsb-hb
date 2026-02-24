@@ -44,8 +44,7 @@ def main() -> None:
 
     # TSB-HB-LogNormal (our main)
     params = fit_tsb_hb(init_set)
-    size_post_mean = np.exp(params.shrunk_mean_log + params.sigma_sq_process / 2.0)
-    forecast_hb_logn = (params.p_posterior * size_post_mean).fillna(0)
+    forecast_hb_logn = (params.p_mean * params.size_mean).fillna(0)
 
     # TSB-HB-Gamma
     item_stats_gamma = g_init.agg({"size": "sum", "occ": "sum"})
@@ -60,7 +59,7 @@ def main() -> None:
     alpha_post = a_hat + item_stats_gamma["size"]
     beta_post = b_hat + item_stats_gamma["occ"]
     size_post_gamma = (alpha_post / beta_post).replace([np.inf, -np.inf], 0).fillna(0)
-    forecast_hb_gamma = (params.p_posterior * size_post_gamma).fillna(0)
+    forecast_hb_gamma = (params.p_mean * size_post_gamma).fillna(0)
 
     # Merge for evaluation
     eva = eval_set[["unique_id", "ds", "y"]].copy()

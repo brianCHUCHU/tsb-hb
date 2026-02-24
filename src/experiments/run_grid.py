@@ -30,8 +30,7 @@ def main() -> None:
 
     # Reference performance for TSB-HB-LogNormal
     params = fit_tsb_hb(init_set)
-    size_post_mean = np.exp(params.shrunk_mean_log + params.sigma_sq_process / 2.0)
-    forecast_hb = (params.p_posterior * size_post_mean).fillna(0)
+    forecast_hb = (params.p_mean * params.size_mean).fillna(0)
     eva_ref = eval_set[["unique_id", "ds", "y"]].merge(forecast_hb.rename("TSB-HB-LogNormal"), on="unique_id", how="left")
     eva_ref["TSB-HB-LogNormal"].fillna(0, inplace=True)
     ref_mae = mae(eva_ref["y"].values, eva_ref["TSB-HB-LogNormal"].values)

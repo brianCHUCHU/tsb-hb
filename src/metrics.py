@@ -106,22 +106,44 @@ def coverage_rate(df: pd.DataFrame, lower_q: float, upper_q: float, alpha: float
 
 
 def pit_values(df: pd.DataFrame, quantiles: Iterable[float] = (0.1, 0.25, 0.5, 0.75, 0.9)) -> np.ndarray:
+    """
+    Randomized PIT for intermittent demand.
+    If y=0, sample PIT from Uniform(0, P(Y=0)).
+    If y>0, use standard interpolation within the remaining probability space.
+    """
     qs = list(quantiles)
+    rng = np.random.default_rng(42)  # 固定種子以確保實驗可重複
     pits = []
+    
     for _, row in df.iterrows():
         y = row["y"]
-        qvals = [row[f"q_{q}"] for q in qs]
-        if y <= qvals[0]:
-            pit = 0.0
-        elif y >= qvals[-1]:
-            pit = 1.0
+        p0 = row.get("prob_zero_predicted", 0.0)
+        
+        if y == 0:
+            # 對於零值，在 [0, P(Y=0)] 區間內隨機採樣
+            pit = rng.uniform(0, p0)
         else:
-            pit = 0.0
-            for i in range(len(qs) - 1):
-                if qvals[i] <= y <= qvals[i + 1]:
-                    q_low, q_high = qs[i], qs[i + 1]
-                    pit = q_low + (q_high - q_low) * (y - qvals[i]) / max(qvals[i + 1] - qvals[i], 1e-12)
-                    break
+            # 對於非零值，在 [P(Y=0), 1] 區間內插值
+            qvals = [row[f"q_{q}"] for q in qs]
+            
+            # 尋找 y 落在的分位數區間
+            if y >= qvals[-1]:
+                pit = rng.uniform(qs[-1], 1.0)
+            elif y <= qvals[0]:
+                lo = min(p0, qs[0])
+                pit = rng.uniform(lo, qs[0]) if lo < qs[0] else qs[0] / 2.0
+            else:
+                target_pit = p0  # 預設
+                for i in range(len(qs) - 1):
+                    if qvals[i] <= y <= qvals[i+1]:
+                        q_low, q_high = qs[i], qs[i+1]
+                        # 確保分母不為 0
+                        dist = max(qvals[i+1] - qvals[i], 1e-12)
+                        interp = (y - qvals[i]) / dist
+                        target_pit = q_low + (q_high - q_low) * interp
+                        break
+                pit = target_pit
+                
         pits.append(pit)
     return np.asarray(pits)
 

@@ -123,13 +123,12 @@ def figure2_cold_start_shrinkage(data_path: Path, out_path: Path):
     forecast_mle = p_mle * size_mle
     
     # TSB-HB forecast
-    p_hb = params.p_posterior.get(selected_item, 0)
-    mu_hb = params.shrunk_mean_log.get(selected_item, 0)
-    size_hb = np.exp(mu_hb + params.sigma_sq_process / 2.0)
+    p_hb = params.p_mean.get(selected_item, 0)
+    size_hb = params.size_mean.get(selected_item, 0)
     forecast_hb = p_hb * size_hb
     
     # Compute global mean (shrinkage target)
-    global_mean = params.p_posterior.mean() * np.exp(params.shrunk_mean_log.mean() + params.sigma_sq_process / 2.0)
+    global_mean = (params.p_mean * params.size_mean).mean()
     
     # Plot with jitter to avoid overlapping zeros
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -237,9 +236,9 @@ def figure3_fan_chart_uai(data_path: Path, out_path: Path):
         fcst = predict_tsb_hb(params, item_eval, quantiles=quantiles, n_samples=3000)
         
         # 計算 Demand Intensity (Mean)
-        p_i = params.p_posterior.get(item_id, 0)
-        mu_i = params.shrunk_mean_log.get(item_id, 0)
-        y_mean = p_i * np.exp(mu_i + params.sigma_sq_process / 2.0)
+        p_i = params.p_mean.get(item_id, 0)
+        size_i = params.size_mean.get(item_id, 0)
+        y_mean = p_i * size_i
         
         # 判斷是否使用對數刻度（當最大需求 > 100 時）
         y_max = max(item_init['y'].max(), item_eval['y'].max())
@@ -487,9 +486,9 @@ def figure5_backtest_forecast(data_path: Path, out_path: Path):
               alpha=0.7, label='Train/Eval Split', zorder=5)
     
     # Plot TSB-HB (constant level for backtest, forecast for future)
-    p_hb = params.p_posterior.get(selected_item, 0)
-    mu_hb = params.shrunk_mean_log.get(selected_item, 0)
-    tsbhb_level = p_hb * np.exp(mu_hb + params.sigma_sq_process / 2.0)
+    p_hb = params.p_mean.get(selected_item, 0)
+    size_hb = params.size_mean.get(selected_item, 0)
+    tsbhb_level = p_hb * size_hb
     ax.plot(item_init['ds'], [tsbhb_level]*len(item_init), '--', 
            color=model_colors['TSB-HB'], linewidth=1.5, alpha=0.6)
     ax.plot(item_eval['ds'], tsbhb_forecast['yhat'].values, '-', 
