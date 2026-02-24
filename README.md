@@ -83,6 +83,7 @@ uv run python -m experiments.<script_name> [options]
 
 - `run_point.py`
 	- **Purpose:** Fits the TSB-HB model, StatsForecast baselines, and hurdle baselines (local/global LogNormal) for point forecasts.
+	- **Hurdle local note:** `Hurdle-Local-LogNormal` is strict per-series (no global fallback for unseen series or sparse-size moments).
 	- **Datasets:** Online Retail (default) and M5 via `--dataset m5`.
 	- **Protocol options (Online Retail):** `--protocol fixed` (single fixed-origin fit) or `--protocol walk_forward` (sequential updates), configurable with `--walk-step`.
 	- **HB controls:** `--hb-regime-aware/--no-hb-regime-aware`, `--hb-group-shrink-strength`, `--hb-online-update/--no-hb-online-update`, `--hb-dynamic-occurrence/--no-hb-dynamic-occurrence`, `--hb-occ-discount`.
@@ -130,9 +131,10 @@ Edit `scripts/experiments/config.v2.env` to toggle protocol/dataset runs and all
 ## Latest benchmark snapshot (2026-02-24, DeepAR excluded)
 
 Source run directory:
-- `outputs/nightly_full_live_20260224_022743`
+- `outputs/hurdle_local_nofallback_20260224_194021`
 
 Closest statistical comparator is `Hurdle-Local-LogNormal`; deltas below are `TSB-HB - Hurdle-Local-LogNormal`.
+This snapshot uses strict local hurdle fitting (no global fallback).
 
 ### Online Retail point forecasting
 
@@ -149,12 +151,12 @@ Takeaway:
 
 | Protocol | dPinball | dCoverage@80 | dAIW@80 | dGoalScore@80 |
 |---|---:|---:|---:|---:|
-| fixed | +0.0028 | +0.0000 | -0.5087 | -0.5599 |
-| walk_forward | +0.0040 | -0.0005 | -0.2901 | -0.3257 |
+| fixed | +0.0028 | -0.0004 | -0.5473 | -0.6067 |
+| walk_forward | +0.0039 | -0.0005 | -0.2931 | -0.3289 |
 
 Positive-only (`y>0`) deltas:
-- fixed: `dPinball_pos=+0.0582`, `dCoverage@80_pos=+0.0001`, `dAIW@80_pos=-1.2509`, `dGoalScore@80_pos=-1.4772`
-- walk_forward: `dPinball_pos=+0.0406`, `dCoverage@80_pos=-0.0018`, `dAIW@80_pos=-0.7115`, `dGoalScore@80_pos=-0.7858`
+- fixed: `dPinball_pos=+0.0598`, `dCoverage@80_pos=-0.0015`, `dAIW@80_pos=-1.3326`, `dGoalScore@80_pos=-1.5399`
+- walk_forward: `dPinball_pos=+0.0401`, `dCoverage@80_pos=-0.0018`, `dAIW@80_pos=-0.7257`, `dGoalScore@80_pos=-0.8036`
 
 Takeaway:
 - TSB-HB gives sharper intervals (smaller AIW) at nearly the same coverage.

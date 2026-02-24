@@ -13,9 +13,6 @@ class HurdleLocalLogNormalParams:
     p_hat: pd.Series
     mean_log: pd.Series
     var_log: pd.Series
-    fallback_p: float
-    fallback_mean_log: float
-    fallback_var_log: float
 
 
 @dataclass
@@ -60,10 +57,6 @@ def fit_hurdle_local_lognormal(train_df: pd.DataFrame) -> HurdleLocalLogNormalPa
     data = train_df[["unique_id", "y"]].copy()
     data["occ"] = (data["y"] > 0).astype(int)
 
-    global_p = float(data["occ"].mean()) if not data.empty else 0.0
-    pos = data.loc[data["y"] > 0, "y"].astype(float)
-    global_mean_log, global_var_log = _safe_log_stats(np.log(pos) if not pos.empty else pd.Series(dtype=float))
-
     g = data.groupby("unique_id")
     p_hat = (g["occ"].sum() / g["occ"].count()).astype(float)
 
@@ -76,18 +69,16 @@ def fit_hurdle_local_lognormal(train_df: pd.DataFrame) -> HurdleLocalLogNormalPa
     var_log = size_stats["var_log"].reindex(idx)
     n_pos = size_stats["n_pos"].reindex(idx).fillna(0)
 
-    mean_log = mean_log.fillna(global_mean_log)
-    var_log = np.where(n_pos.values == 0, global_var_log, var_log.values)
+    # Strict local baseline: no global fallback; no positive samples => unused stats (set to 0).
+    mean_log = mean_log.fillna(0.0)
+    var_log = np.where(n_pos.values == 0, 0.0, var_log.values)
     var_log = np.where(n_pos.values == 1, 0.0, var_log)
-    var_log = pd.Series(var_log, index=idx).fillna(global_var_log).clip(lower=0.0)
+    var_log = pd.Series(var_log, index=idx).fillna(0.0).clip(lower=0.0)
 
     return HurdleLocalLogNormalParams(
         p_hat=p_hat,
         mean_log=mean_log,
         var_log=var_log,
-        fallback_p=global_p,
-        fallback_mean_log=global_mean_log,
-        fallback_var_log=max(global_var_log, 0.0),
     )
 
 
@@ -98,9 +89,17 @@ def predict_hurdle_local_lognormal(
 ) -> pd.DataFrame:
     out = eval_df[["unique_id", "ds"]].copy()
 
-    p = out["unique_id"].map(params.p_hat).fillna(params.fallback_p).clip(0.0, 1.0)
-    mean_log = out["unique_id"].map(params.mean_log).fillna(params.fallback_mean_log)
-    var_log = out["unique_id"].map(params.var_log).fillna(params.fallback_var_log).clip(lower=0.0)
+    p = out["unique_id"].map(params.p_hat)
+    if p.isna().any():
+        missing_ids = out.loc[p.isna(), "unique_id"].drop_duplicates().tolist()
+        preview = ", ".join(str(x) for x in missing_ids[:10])
+        raise ValueError(
+            f"Hurdle local baseline requires per-series training stats; "
+            f"found {len(missing_ids)} unseen unique_id(s) in eval: {preview}"
+        )
+    p = p.clip(0.0, 1.0)
+    mean_log = out["unique_id"].map(params.mean_log).fillna(0.0)
+    var_log = out["unique_id"].map(params.var_log).fillna(0.0).clip(lower=0.0)
 
     out["Hurdle-Local-LogNormal"] = p.values * np.exp(mean_log.values + 0.5 * var_log.values)
 
