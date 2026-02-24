@@ -485,7 +485,7 @@ def main() -> None:
     ap.add_argument("--hb-dynamic-occurrence", dest="hb_dynamic_occurrence", action="store_true", default=False, help="Enable dynamic discounted occurrence update for TSB-HB in online walk-forward.")
     ap.add_argument("--no-hb-dynamic-occurrence", dest="hb_dynamic_occurrence", action="store_false", help="Disable dynamic discounted occurrence update.")
     ap.add_argument("--hb-occ-discount", type=float, default=1.0, help="Discount factor for dynamic occurrence update (0<d<=1). Smaller means faster adaptation.")
-    ap.add_argument("--hb-item-variance-mode", choices=["group", "conjugate"], default="group", help="Process variance mode for size: group or conjugate.")
+    ap.add_argument("--hb-item-variance-mode", choices=["group", "conjugate"], default="conjugate", help="Process variance mode for size: group or conjugate.")
     ap.add_argument("--hb-variance-prior-df", type=float, default=20.0, help="Prior degrees of freedom for conjugate variance model (larger = stronger shrinkage).")
     ap.add_argument("--m5-hierarchy-mode", choices=["off", "on", "ablation"], default="ablation", help="M5 hierarchy usage for TSB-HB: off=global priors, on=hier priors, ablation=report both.")
     ap.add_argument("--data", type=Path, default=default_data_file())

@@ -636,6 +636,35 @@ def _resolve_uid_group(params: TSBHBParams, uid: str) -> str:
     return str(grp)
 
 
+def _analytic_mixture_quantile(
+    p: np.ndarray,
+    mu: np.ndarray,
+    pred_var: np.ndarray,
+    q: float,
+) -> np.ndarray:
+    """Analytic quantile for zero-inflated LogNormal: Bernoulli(p) × LogNormal(mu, pred_var)."""
+    p = np.clip(p, 0.0, 1.0)
+    mass_at_zero = 1.0 - p
+    result = np.zeros_like(p)
+
+    active = q > mass_at_zero
+    if not np.any(active):
+        return result
+
+    q_adj = (q - mass_at_zero[active]) / np.maximum(p[active], 1e-12)
+    q_adj = np.clip(q_adj, 1e-12, 1.0 - 1e-12)
+
+    sigma = np.sqrt(np.maximum(pred_var[active], 0.0))
+    has_var = sigma > 0
+    result_active = np.where(
+        has_var,
+        np.exp(mu[active] + sigma * norm.ppf(q_adj)),
+        np.exp(mu[active]),
+    )
+    result[active] = np.maximum(result_active, 0.0)
+    return result
+
+
 def predict_tsb_hb(
     params: TSBHBParams,
     eval_df: pd.DataFrame,
@@ -646,9 +675,9 @@ def predict_tsb_hb(
     """Predict on the evaluation set.
 
     - Point forecast: per-series constant mean across horizon.
-    - Probabilistic forecast:
-      - default plug-in EB uncertainty (posterior + process variance),
-      - optional bootstrap hyperparameter uncertainty if available in params.
+    - Probabilistic forecast: analytic mixture quantiles (zero-inflated LogNormal).
+      When bootstrap hyperparameter draws are available *and* include_hyper_uncertainty
+      is True, quantiles are averaged over bootstrap draws for robustness.
     """
     out = eval_df[["unique_id", "ds"]].copy()
 
@@ -663,43 +692,15 @@ def predict_tsb_hb(
         return out
 
     qcols = [f"q_{q}" for q in quantiles]
-    rows: list[pd.DataFrame] = []
-    uids = out["unique_id"].dropna().astype(str).unique().tolist()
-    rng = np.random.default_rng()
-    prior_min = float(max(params.prior_strength_min, 1e-6))
-    prior_max = float(max(params.prior_strength_max, 1e-6))
-    if prior_min > prior_max:
-        prior_min, prior_max = prior_max, prior_min
-    prior_power = float(max(params.prior_strength_power, 0.0))
-    var_mode = str(params.item_variance_mode).lower()
-    if var_mode == "shrink_item":
-        var_mode = "conjugate"
-    if var_mode not in {"group", "conjugate"}:
-        var_mode = "group"
-    var_prior_df = float(max(params.item_variance_shrink_strength, 2.1))
 
-    group_ref_n_obs: dict[str, float] = {}
-    group_ref_n_pos: dict[str, float] = {}
-    global_ref_n_obs = 1.0
-    global_ref_n_pos = 1.0
-    if params.adaptive_prior_strength:
-        ref_df = pd.DataFrame(
-            {
-                "group": params.group_labels.astype(str),
-                "n_obs": params.n_obs.reindex(params.group_labels.index).fillna(0.0),
-                "n_pos": params.n_pos.reindex(params.group_labels.index).fillna(0.0),
-            }
-        )
-        if not ref_df.empty:
-            group_ref_n_obs = ref_df.groupby("group", sort=False)["n_obs"].median().to_dict()
-            group_ref_n_pos = ref_df.groupby("group", sort=False)["n_pos"].median().to_dict()
-            global_ref_n_obs = float(np.nanmedian(ref_df["n_obs"].to_numpy()))
-            pos_counts = ref_df["n_pos"][ref_df["n_pos"] > 0].to_numpy()
-            global_ref_n_pos = float(np.nanmedian(pos_counts)) if len(pos_counts) > 0 else 1.0
-        if not np.isfinite(global_ref_n_obs) or global_ref_n_obs <= 0:
-            global_ref_n_obs = 1.0
-        if not np.isfinite(global_ref_n_pos) or global_ref_n_pos <= 0:
-            global_ref_n_pos = 1.0
+    uid_arr = out["unique_id"].to_numpy()
+    p_arr = pd.Series(uid_arr).map(params.p_posterior).fillna(params.p_posterior.mean()).to_numpy(dtype=float)
+    p_arr = np.clip(p_arr, 0.0, 1.0)
+    mu_arr = pd.Series(uid_arr).map(params.shrunk_mean_log).fillna(params.shrunk_mean_log.mean()).to_numpy(dtype=float)
+    sigma_arr = pd.Series(uid_arr).map(params.sigma_sq_process).fillna(params.sigma_sq_process.mean()).to_numpy(dtype=float)
+    var_mu_arr = pd.Series(uid_arr).map(params.posterior_var_mu).fillna(params.posterior_var_mu.mean()).to_numpy(dtype=float)
+
+    pred_var_arr = np.maximum(sigma_arr + var_mu_arr, 1e-9)
 
     use_bootstrap = (
         include_hyper_uncertainty
@@ -708,105 +709,82 @@ def predict_tsb_hb(
         and not params.bootstrap_group_hypers["alpha"].empty
     )
 
-    for uid in uids:
-        ds_vals = out.loc[out["unique_id"].astype(str) == uid, "ds"].to_numpy()
-        if len(ds_vals) == 0:
-            continue
-
-        grp_for_uid = _resolve_uid_group(params, uid)
-        n_obs = _resolve_uid_series_value(params.n_obs, uid, 0.0)
-        s_obs = _resolve_uid_series_value(params.s_obs, uid, 0.0)
-        n_pos = _resolve_uid_series_value(params.n_pos, uid, 0.0)
-        sum_log = _resolve_uid_series_value(params.sum_log, uid, 0.0)
-        mean_mle = sum_log / n_pos if n_pos > 0 else np.nan
-        item_var = np.nan
+    if use_bootstrap:
+        n_obs_arr = pd.Series(uid_arr).map(params.n_obs).fillna(0.0).to_numpy(dtype=float)
+        s_obs_arr = pd.Series(uid_arr).map(params.s_obs).fillna(0.0).to_numpy(dtype=float)
+        n_pos_arr = pd.Series(uid_arr).map(params.n_pos).fillna(0.0).to_numpy(dtype=float)
+        sum_log_arr = pd.Series(uid_arr).map(params.sum_log).fillna(0.0).to_numpy(dtype=float)
+        mean_mle_arr = np.where(n_pos_arr > 0, sum_log_arr / n_pos_arr, 0.0)
+        group_arr = pd.Series(uid_arr).map(params.group_labels).fillna(GLOBAL_GROUP).to_numpy()
+        item_var_arr = np.full(len(uid_arr), np.nan)
         if params.item_var_log is not None:
-            item_var = _resolve_uid_series_value(params.item_var_log, uid, np.nan)
-        occ_scale = 1.0
-        size_scale = 1.0
-        if params.adaptive_prior_strength:
-            ref_occ = float(group_ref_n_obs.get(grp_for_uid, global_ref_n_obs))
-            if not np.isfinite(ref_occ) or ref_occ <= 0:
-                ref_occ = global_ref_n_obs
-            occ_scale = float(np.clip((ref_occ / max(n_obs, 1.0)) ** prior_power, prior_min, prior_max))
+            item_var_arr = pd.Series(uid_arr).map(params.item_var_log).fillna(np.nan).to_numpy(dtype=float)
 
-            ref_pos = float(group_ref_n_pos.get(grp_for_uid, global_ref_n_pos))
-            if not np.isfinite(ref_pos) or ref_pos <= 0:
-                ref_pos = global_ref_n_pos
-            size_scale = float(np.clip((ref_pos / max(n_pos, 1.0)) ** prior_power, prior_min, prior_max))
+        var_mode = str(params.item_variance_mode).lower()
+        if var_mode == "shrink_item":
+            var_mode = "conjugate"
+        if var_mode not in {"group", "conjugate"}:
+            var_mode = "group"
+        var_prior_df = float(max(params.item_variance_shrink_strength, 2.1))
 
-        if use_bootstrap:
-            grp = grp_for_uid
-            alpha_df = params.bootstrap_group_hypers["alpha"]
-            beta_df = params.bootstrap_group_hypers["beta"]
-            mu_df = params.bootstrap_group_hypers["size_mu"]
-            sigma_df = params.bootstrap_group_hypers["size_sigma"]
-            tau_df = params.bootstrap_group_hypers["size_tau"]
-            if grp not in alpha_df.index:
-                grp = GLOBAL_GROUP if GLOBAL_GROUP in alpha_df.index else alpha_df.index[0]
+        alpha_df = params.bootstrap_group_hypers["alpha"]
+        beta_df = params.bootstrap_group_hypers["beta"]
+        mu_df = params.bootstrap_group_hypers["size_mu"]
+        sigma_df = params.bootstrap_group_hypers["size_sigma"]
+        tau_df = params.bootstrap_group_hypers["size_tau"]
+        n_draws = alpha_df.shape[1]
 
-            alpha_draws = alpha_df.loc[grp].to_numpy(dtype=float)
-            beta_draws = beta_df.loc[grp].to_numpy(dtype=float)
-            mu_draws = mu_df.loc[grp].to_numpy(dtype=float)
-            sigma_draws = np.maximum(sigma_df.loc[grp].to_numpy(dtype=float), 1e-9)
-            tau_draws = np.maximum(tau_df.loc[grp].to_numpy(dtype=float), 1e-9)
+        q_accum = {f"q_{q}": np.zeros(len(uid_arr), dtype=float) for q in quantiles}
+        p_accum = np.zeros(len(uid_arr), dtype=float)
 
-            if len(alpha_draws) == 0:
-                use_bootstrap = False
-            else:
-                draw_idx = rng.integers(0, len(alpha_draws), size=n_samples)
-                alpha_s = alpha_draws[draw_idx]
-                beta_s = beta_draws[draw_idx]
-                mu_global_s = mu_draws[draw_idx]
-                sigma_s = sigma_draws[draw_idx]
-                tau_s = tau_draws[draw_idx]
-                alpha_s_eff = np.maximum(alpha_s * occ_scale, 1e-9)
-                beta_s_eff = np.maximum(beta_s * occ_scale, 1e-9)
-                p_s = (alpha_s_eff + s_obs) / (alpha_s_eff + beta_s_eff + n_obs)
-                p_s = np.clip(p_s, 0.0, 1.0)
+        for d in range(n_draws):
+            col = alpha_df.columns[d]
+            grp_resolved = np.array([
+                g if g in alpha_df.index else (GLOBAL_GROUP if GLOBAL_GROUP in alpha_df.index else alpha_df.index[0])
+                for g in group_arr
+            ])
+            alpha_d = pd.Series(grp_resolved).map(alpha_df[col]).to_numpy(dtype=float)
+            beta_d = pd.Series(grp_resolved).map(beta_df[col]).to_numpy(dtype=float)
+            mu_global_d = pd.Series(grp_resolved).map(mu_df[col]).to_numpy(dtype=float)
+            sigma_d = np.maximum(pd.Series(grp_resolved).map(sigma_df[col]).to_numpy(dtype=float), 1e-9)
+            tau_d = np.maximum(pd.Series(grp_resolved).map(tau_df[col]).to_numpy(dtype=float), 1e-9)
 
-                if var_mode == "conjugate" and np.isfinite(item_var) and n_pos > 1.0:
-                    nu = var_prior_df
-                    denom = nu + n_pos - 3.0
-                    if denom > 1e-9:
-                        sigma_s = np.maximum(((nu - 2.0) * sigma_s + (n_pos - 1.0) * item_var) / denom, 1e-9)
-                k_s = np.maximum((sigma_s / tau_s) * size_scale, 1e-9)
+            alpha_d = np.maximum(alpha_d, 1e-9)
+            beta_d = np.maximum(beta_d, 1e-9)
+            p_d = (alpha_d + s_obs_arr) / (alpha_d + beta_d + n_obs_arr)
+            p_d = np.clip(p_d, 0.0, 1.0)
 
-                if n_pos > 0:
-                    credibility = n_pos / (n_pos + k_s)
-                    mu_s = credibility * mean_mle + (1.0 - credibility) * mu_global_s
-                    var_mu_s = sigma_s / (n_pos + k_s)
-                else:
-                    mu_s = mu_global_s
-                    var_mu_s = sigma_s / k_s
-                pred_std_s = np.sqrt(np.maximum(sigma_s + var_mu_s, 1e-9))
+            if var_mode == "conjugate":
+                conj_ok = np.isfinite(item_var_arr) & (n_pos_arr > 1.0)
+                nu = var_prior_df
+                denom = nu + n_pos_arr - 3.0
+                conj_ok = conj_ok & (denom > 1e-9)
+                sigma_d = np.where(
+                    conj_ok,
+                    np.maximum(((nu - 2.0) * sigma_d + (n_pos_arr - 1.0) * item_var_arr) / denom, 1e-9),
+                    sigma_d,
+                )
 
-                demand_occurs = rng.binomial(1, p_s, n_samples)
-                log_samples = rng.normal(loc=mu_s, scale=pred_std_s, size=n_samples)
-                samples = np.exp(log_samples) * demand_occurs
-                qvals = {f"q_{q}": float(np.quantile(samples, q)) for q in quantiles}
-                qvals["prob_zero_predicted"] = float(np.mean(1.0 - p_s))
-                tmp = pd.DataFrame({**qvals, "unique_id": uid, "ds": ds_vals})
-                rows.append(tmp)
-                continue
+            k_d = np.maximum(sigma_d / tau_d, 1e-9)
+            cred_d = np.where(n_pos_arr > 0, n_pos_arr / (n_pos_arr + k_d), 0.0)
+            mu_d = np.where(n_pos_arr > 0, cred_d * mean_mle_arr + (1.0 - cred_d) * mu_global_d, mu_global_d)
+            var_mu_d = np.where(n_pos_arr > 0, sigma_d / (n_pos_arr + k_d), sigma_d / k_d)
+            pred_var_d = np.maximum(sigma_d + var_mu_d, 1e-9)
 
-        p = _resolve_uid_series_value(params.p_posterior, uid, 0.0)
-        mu = _resolve_uid_series_value(params.shrunk_mean_log, uid, 0.0)
-        sigma = _resolve_uid_series_value(params.sigma_sq_process, uid, 1e-6)
-        var_mu = _resolve_uid_series_value(params.posterior_var_mu, uid, 1e-6)
-        pred_std = float(np.sqrt(max(sigma + var_mu, 1e-9)))
+            for q in quantiles:
+                q_accum[f"q_{q}"] += _analytic_mixture_quantile(p_d, mu_d, pred_var_d, q)
+            p_accum += (1.0 - p_d)
 
-        demand_occurs = rng.binomial(1, np.clip(p, 0.0, 1.0), n_samples)
-        log_samples = rng.normal(loc=mu, scale=pred_std, size=n_samples)
-        samples = np.exp(log_samples) * demand_occurs
-        qvals = {f"q_{q}": float(np.quantile(samples, q)) for q in quantiles}
-        qvals["prob_zero_predicted"] = float(1.0 - np.clip(p, 0.0, 1.0))
-        tmp = pd.DataFrame({**qvals, "unique_id": uid, "ds": ds_vals})
-        rows.append(tmp)
+        for q in quantiles:
+            out[f"q_{q}"] = q_accum[f"q_{q}"] / n_draws
+        out["prob_zero_predicted"] = p_accum / n_draws
 
-    if not rows:
-        return pd.DataFrame(columns=["unique_id", "ds"] + qcols)
-    return pd.concat(rows, ignore_index=True)
+    else:
+        for q in quantiles:
+            out[f"q_{q}"] = _analytic_mixture_quantile(p_arr, mu_arr, pred_var_arr, q)
+        out["prob_zero_predicted"] = 1.0 - p_arr
+
+    return out
 
 
 def _params_from_online_state(state: TSBHBOnlineState) -> TSBHBParams:

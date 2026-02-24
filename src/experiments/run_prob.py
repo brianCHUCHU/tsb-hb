@@ -25,6 +25,7 @@ from models.hurdle_baselines import (
     predict_hurdle_global_lognormal,
     predict_hurdle_local_lognormal,
 )
+from models.conformal import fit_predict_conformal_baselines
 from metrics import coverage_rate, pit_values, compute_adi_cv2, classify_adi_cv2
 
 # Optional neural baseline
@@ -32,7 +33,7 @@ try:
     from neuralforecast import NeuralForecast
     from neuralforecast.models import DeepAR
     from neuralforecast.losses.pytorch import DistributionLoss
-except ImportError:
+except (ImportError, AttributeError):
     NeuralForecast = None
 
 
@@ -330,6 +331,8 @@ def _predict_prob_models_once(
     hb_variance_prior_df: float = 20.0,
     hb_calibration: Optional[dict[str, float | str]] = None,
     baseline_mode: str = "full",
+    include_conformal: bool = False,
+    conformal_cal_ratio: float = 0.2,
 ) -> pd.DataFrame:
     qcols = _qcols(quantiles)
     if eval_df.empty:
@@ -364,7 +367,20 @@ def _predict_prob_models_once(
         quantiles,
         baseline_mode=baseline_mode,
     )
-    return pd.concat([tsbhb_q, non_hb], ignore_index=True)
+
+    all_frames = [tsbhb_q, non_hb]
+
+    if include_conformal and baseline_mode in {"full", "hurdle_only"}:
+        conformal_q = fit_predict_conformal_baselines(
+            train_df, eval_df,
+            quantiles=quantiles,
+            cal_ratio=conformal_cal_ratio,
+            freq="D",
+        )
+        if not conformal_q.empty:
+            all_frames.append(conformal_q)
+
+    return pd.concat(all_frames, ignore_index=True)
 
 
 def _rolling_forecast_over_eval_probabilistic(
@@ -716,7 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--hb-dynamic-occurrence", dest="hb_dynamic_occurrence", action="store_true", default=False, help="Enable discounted dynamic occurrence updates for TSB-HB in walk-forward.")
     ap.add_argument("--no-hb-dynamic-occurrence", dest="hb_dynamic_occurrence", action="store_false", help="Disable dynamic occurrence updates.")
     ap.add_argument("--hb-occ-discount", type=float, default=1.0, help="Discount factor for dynamic occurrence update (0<d<=1).")
-    ap.add_argument("--hb-item-variance-mode", choices=["group", "conjugate"], default="group", help="Process variance mode for size: group or conjugate.")
+    ap.add_argument("--hb-item-variance-mode", choices=["group", "conjugate"], default="conjugate", help="Process variance mode for size: group or conjugate.")
     ap.add_argument("--hb-variance-prior-df", type=float, default=20.0, help="Prior degrees of freedom for conjugate variance model (larger = stronger shrinkage).")
     ap.add_argument("--hb-bootstrap-draws", type=int, default=20, help="Bootstrap draws for TSB-HB hyperparameter uncertainty (fixed protocol).")
     ap.add_argument("--hb-disable-hyper-uncertainty", action="store_true", help="Disable bootstrap hyperparameter uncertainty even when draws > 0.")
@@ -727,6 +743,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--hb-calibration-lambda-max", type=float, default=1.20, help="Upper bound for location-scale calibration lambda.")
     ap.add_argument("--hb-calibration-lambda-steps", type=int, default=13, help="Number of lambda grid points for location-scale calibration.")
     ap.add_argument("--hb-calibration-coverage-weight", type=float, default=0.50, help="Penalty weight on coverage gaps when fitting location-scale calibration.")
+    ap.add_argument("--include-conformal-baselines", dest="include_conformal", action="store_true", default=True, help="Include conformal prediction intervals for point baselines (CP-Croston, CP-SBA, etc.).")
+    ap.add_argument("--no-conformal-baselines", dest="include_conformal", action="store_false", help="Exclude conformal baselines.")
+    ap.add_argument("--conformal-cal-ratio", type=float, default=0.2, help="Calibration ratio for conformal prediction split (fraction of training data held out).")
     ap.add_argument("--with-deepar", action="store_true", help="Include DeepAR baseline (fixed protocol only).")
     ap.add_argument("--horizon", type=int, default=10, help="Block size for DeepAR rolling forecast.")
     ap.add_argument("--input-size", type=int, default=14)
@@ -798,6 +817,8 @@ def run(args: argparse.Namespace) -> None:
             hb_variance_prior_df=hb_variance_prior_df,
             hb_calibration=hb_calibration,
             baseline_mode=baseline_mode,
+            include_conformal=bool(args.include_conformal),
+            conformal_cal_ratio=float(args.conformal_cal_ratio),
         )
         if args.with_deepar:
             deepar_q = _predict_deepar_fixed(
@@ -851,7 +872,17 @@ def run(args: argparse.Namespace) -> None:
                     quantiles=QUANTILES,
                     baseline_mode=baseline_mode,
                 )
-                step_q = pd.concat([tsbhb_q, non_hb_q], ignore_index=True)
+                step_frames = [tsbhb_q, non_hb_q]
+                if args.include_conformal and baseline_mode in {"full", "hurdle_only"}:
+                    cp_q = fit_predict_conformal_baselines(
+                        frame.history, frame.target,
+                        quantiles=QUANTILES,
+                        cal_ratio=float(args.conformal_cal_ratio),
+                        freq="D",
+                    )
+                    if not cp_q.empty:
+                        step_frames.append(cp_q)
+                step_q = pd.concat(step_frames, ignore_index=True)
                 hb_state = update_online_tsb_hb(hb_state, frame.target)
             else:
                 step_q = _predict_prob_models_once(
@@ -867,6 +898,8 @@ def run(args: argparse.Namespace) -> None:
                     hb_variance_prior_df=hb_variance_prior_df,
                     hb_calibration=hb_calibration,
                     baseline_mode=baseline_mode,
+                    include_conformal=bool(args.include_conformal),
+                    conformal_cal_ratio=float(args.conformal_cal_ratio),
                 )
             step_outputs.append(step_q)
         if not step_outputs:
