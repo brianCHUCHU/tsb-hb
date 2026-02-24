@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-import numpy as np
 import pandas as pd
 
 
@@ -29,6 +28,60 @@ def _import_statsforecast():
     }
 
 
+def _prepare_horizons(horizons: pd.Series) -> pd.DataFrame:
+    """Normalize horizon series into a two-column frame: [unique_id, h]."""
+    if horizons.empty:
+        return pd.DataFrame(columns=["unique_id", "h"])
+
+    h = horizons.astype(int)
+    h = h[h > 0]
+    if h.empty:
+        return pd.DataFrame(columns=["unique_id", "h"])
+
+    h_df = h.rename("h").reset_index()
+    uid_col = h_df.columns[0]
+    if uid_col != "unique_id":
+        h_df = h_df.rename(columns={uid_col: "unique_id"})
+    return h_df[["unique_id", "h"]]
+
+
+def _fit_predict_panel(
+    train_df: pd.DataFrame,
+    horizon_df: pd.DataFrame,
+    models: list,
+    freq: str,
+    probabilistic: bool,
+    levels: Optional[List[int]],
+) -> pd.DataFrame:
+    """Fit panel baselines once and trim per-series horizons."""
+    if horizon_df.empty:
+        return pd.DataFrame()
+
+    StatsForecast, _ = _import_statsforecast()
+    valid_uids = set(horizon_df["unique_id"].tolist())
+    train_panel = train_df.loc[train_df["unique_id"].isin(valid_uids), ["unique_id", "ds", "y"]]
+    if train_panel.empty:
+        return pd.DataFrame()
+
+    h_max = int(horizon_df["h"].max())
+    sf = StatsForecast(models=models, freq=freq, n_jobs=-1)
+    sf.fit(df=train_panel)
+
+    if probabilistic:
+        try:
+            pred = sf.predict(h=h_max, level=levels or [80, 50])
+        except TypeError:
+            pred = sf.forecast(df=train_panel, h=h_max, level=levels or [80, 50])
+    else:
+        pred = sf.predict(h=h_max)
+
+    out = pred.reset_index()
+    out["h_step"] = out.groupby("unique_id").cumcount() + 1
+    out = out.merge(horizon_df, on="unique_id", how="inner")
+    out = out[out["h_step"] <= out["h"]].drop(columns=["h_step", "h"])
+    return out.reset_index(drop=True)
+
+
 def fit_predict_baselines(
     train_df: pd.DataFrame,
     horizons: pd.Series,
@@ -37,45 +90,28 @@ def fit_predict_baselines(
     probabilistic: bool = False,
     levels: Optional[List[int]] = None,
 ) -> pd.DataFrame:
-    """Fit StatsForecast baselines per-series and return predictions.
-
-    Parameters
-    - train_df: DataFrame with columns [unique_id, ds, y]
-    - horizons: pandas Series mapping unique_id -> horizon (int)
-    - freq: pandas frequency string
-    - tsb_grid: if provided, only fit TSB over the grid of (alpha_d, alpha_p)
-    - probabilistic: if True, include prediction intervals via `levels`
-    - levels: list of confidence levels, e.g., [80, 50]
-    """
-    StatsForecast, M = _import_statsforecast()
-
-    uids = train_df["unique_id"].unique().tolist()
-    outputs = []
+    """Fit StatsForecast baselines on panel data and return predictions."""
+    _, M = _import_statsforecast()
+    horizon_df = _prepare_horizons(horizons)
 
     if tsb_grid is not None:
-        # Grid for TSB only
+        outputs = []
         for alpha_d, alpha_p in tsb_grid:
-            model = M["TSB"](alpha_d=alpha_d, alpha_p=alpha_p)
-            sf = StatsForecast(models=[model], freq=freq, n_jobs=-1)
-            for uid in uids:
-                h = int(horizons.get(uid, 0))
-                if h <= 0:
-                    continue
-                df_uid = train_df.loc[train_df["unique_id"] == uid, ["unique_id", "ds", "y"]]
-                if df_uid.empty:
-                    continue
-                sf.fit(df=df_uid)
-                if probabilistic:
-                    pred = sf.forecast(df=df_uid, h=h, level=levels or [80])
-                else:
-                    pred = sf.predict(h=h)
-                tmp = pred.reset_index()
-                tmp["alpha_d"] = alpha_d
-                tmp["alpha_p"] = alpha_p
-                outputs.append(tmp)
+            tmp = _fit_predict_panel(
+                train_df=train_df,
+                horizon_df=horizon_df,
+                models=[M["TSB"](alpha_d=alpha_d, alpha_p=alpha_p)],
+                freq=freq,
+                probabilistic=probabilistic,
+                levels=levels,
+            )
+            if tmp.empty:
+                continue
+            tmp["alpha_d"] = alpha_d
+            tmp["alpha_p"] = alpha_p
+            outputs.append(tmp)
         return pd.concat(outputs, ignore_index=True) if outputs else pd.DataFrame()
 
-    # Default full baseline set
     if probabilistic:
         models = [
             M["AutoARIMA"](season_length=7),
@@ -91,21 +127,12 @@ def fit_predict_baselines(
             M["AutoTheta"](),
             M["AutoARIMA"](),
         ]
-    sf = StatsForecast(models=models, freq=freq, n_jobs=-1)
 
-    for uid in uids:
-        h = int(horizons.get(uid, 0))
-        if h <= 0:
-            continue
-        df_uid = train_df.loc[train_df["unique_id"] == uid, ["unique_id", "ds", "y"]]
-        if df_uid.empty:
-            continue
-        sf.fit(df=df_uid)
-        if probabilistic:
-            pred = sf.forecast(df=df_uid, h=h, level=levels or [80, 50])
-        else:
-            pred = sf.predict(h=h)
-        outputs.append(pred.reset_index())
-
-    return pd.concat(outputs, ignore_index=True) if outputs else pd.DataFrame()
-
+    return _fit_predict_panel(
+        train_df=train_df,
+        horizon_df=horizon_df,
+        models=models,
+        freq=freq,
+        probabilistic=probabilistic,
+        levels=levels,
+    )

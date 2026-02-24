@@ -2,19 +2,32 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List
+from typing import Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 from utils import set_seed, default_data_file, default_out_dir
 from data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
-from models.tsb_hb import fit_tsb_hb, predict_tsb_hb
+from experiments.protocols import evaluate_prob_models, iter_walk_forward_frames
+from models.tsb_hb import (
+    fit_tsb_hb,
+    initialize_online_tsb_hb,
+    predict_online_tsb_hb,
+    predict_tsb_hb,
+    update_online_tsb_hb,
+)
 from models.baselines import fit_predict_baselines
+from models.hurdle_baselines import (
+    fit_hurdle_global_lognormal,
+    fit_hurdle_local_lognormal,
+    predict_hurdle_global_lognormal,
+    predict_hurdle_local_lognormal,
+)
+from metrics import coverage_rate, pit_values, compute_adi_cv2, classify_adi_cv2
 
-# Lazy import neuralforecast
+# Optional neural baseline
 try:
     from neuralforecast import NeuralForecast
     from neuralforecast.models import DeepAR
@@ -23,8 +36,335 @@ except ImportError:
     NeuralForecast = None
 
 
-def _parse_horizons(arg: str) -> List[int]:
-    return [int(x) for x in arg.split(",") if x.strip()]
+QUANTILES = [0.10, 0.25, 0.50, 0.75, 0.90]
+
+
+def _qcols(quantiles: list[float]) -> list[str]:
+    return [f"q_{q}" for q in quantiles]
+
+
+def _build_regime_group_labels(train_df: pd.DataFrame) -> pd.Series | None:
+    feats = compute_adi_cv2(train_df)
+    if feats.empty:
+        return None
+    feats["category"] = feats.apply(classify_adi_cv2, axis=1)
+    return feats.set_index("unique_id")["category"].astype(str)
+
+
+def _enforce_monotonic_quantiles(df: pd.DataFrame, quantiles: list[float]) -> pd.DataFrame:
+    out = df.copy()
+    qcols = _qcols(quantiles)
+    for c in qcols:
+        if c not in out.columns:
+            out[c] = np.nan
+    arr = out[qcols].to_numpy(dtype=float)
+    arr = np.where(np.isnan(arr), np.nan, np.maximum(arr, 0.0))
+    for j in range(1, arr.shape[1]):
+        prev = arr[:, j - 1]
+        cur = arr[:, j]
+        cur = np.where(np.isnan(cur), prev, cur)
+        prev_filled = np.where(np.isnan(prev), cur, prev)
+        arr[:, j] = np.maximum(cur, prev_filled)
+    out[qcols] = arr
+    return out
+
+
+def _split_hb_calibration_train(
+    init_set: pd.DataFrame,
+    calibration_ratio: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ratio = float(np.clip(calibration_ratio, 0.0, 0.8))
+    if ratio <= 0.0:
+        return init_set.copy(), pd.DataFrame(columns=init_set.columns)
+
+    pieces_train: list[pd.DataFrame] = []
+    pieces_calib: list[pd.DataFrame] = []
+    for _, grp in init_set.sort_values(["unique_id", "ds"]).groupby("unique_id", sort=False):
+        n = len(grp)
+        if n <= 1:
+            pieces_train.append(grp)
+            continue
+        cut = int(np.floor(n * (1.0 - ratio)))
+        cut = max(min(cut, n - 1), 1)
+        pieces_train.append(grp.iloc[:cut])
+        pieces_calib.append(grp.iloc[cut:])
+
+    train_df = pd.concat(pieces_train, ignore_index=True) if pieces_train else init_set.iloc[0:0].copy()
+    calib_df = pd.concat(pieces_calib, ignore_index=True) if pieces_calib else init_set.iloc[0:0].copy()
+    return train_df, calib_df
+
+
+def _pinball_mean(eval_merged: pd.DataFrame, quantiles: list[float]) -> float:
+    losses: list[float] = []
+    for q in quantiles:
+        col = f"q_{q}"
+        if col not in eval_merged.columns:
+            continue
+        dfx = eval_merged.dropna(subset=[col])
+        if dfx.empty:
+            continue
+        err = dfx["y"] - dfx[col]
+        loss = np.maximum(q * err, (q - 1) * err).mean()
+        losses.append(float(loss))
+    if not losses:
+        return float("nan")
+    return float(np.mean(losses))
+
+
+def _fit_hb_location_scale(
+    init_set: pd.DataFrame,
+    quantiles: list[float],
+    hb_regime_aware: bool,
+    hb_group_shrink_strength: float,
+    hb_item_variance_mode: str,
+    hb_variance_prior_df: float,
+    hb_bootstrap_draws: int,
+    hb_bootstrap_seed: Optional[int],
+    hb_use_hyper_uncertainty: bool,
+    calibration_ratio: float,
+    calibration_samples: int,
+    lambda_min: float,
+    lambda_max: float,
+    lambda_steps: int,
+    coverage_weight: float,
+) -> dict[str, float | str]:
+    default: dict[str, float | str] = {"mode": "location_scale", "delta": 0.0, "lambda": 1.0}
+    train_fit, calib_set = _split_hb_calibration_train(init_set, calibration_ratio=calibration_ratio)
+    if calib_set.empty or train_fit.empty:
+        return default
+
+    group_labels = _build_regime_group_labels(train_fit) if hb_regime_aware else None
+    params = fit_tsb_hb(
+        train_fit,
+        group_labels=group_labels,
+        bootstrap_draws=max(int(hb_bootstrap_draws), 0),
+        bootstrap_seed=hb_bootstrap_seed,
+        group_shrink_strength=hb_group_shrink_strength,
+        item_variance_mode=hb_item_variance_mode,
+        item_variance_shrink_strength=hb_variance_prior_df,
+    )
+    calib_q = predict_tsb_hb(
+        params,
+        calib_set,
+        quantiles=quantiles,
+        n_samples=max(int(calibration_samples), 200),
+        include_hyper_uncertainty=hb_use_hyper_uncertainty,
+    )
+    merged_raw = calib_set[["unique_id", "ds", "y"]].merge(calib_q, on=["unique_id", "ds"], how="inner")
+    if merged_raw.empty or "q_0.5" not in merged_raw.columns:
+        return default
+
+    delta = float(np.nanmedian((merged_raw["y"] - merged_raw["q_0.5"]).to_numpy(dtype=float)))
+    if not np.isfinite(delta):
+        delta = 0.0
+
+    lam_lo = float(lambda_min)
+    lam_hi = float(lambda_max)
+    if lam_lo > lam_hi:
+        lam_lo, lam_hi = lam_hi, lam_lo
+    n_steps = max(int(lambda_steps), 2)
+    lambdas = np.linspace(lam_lo, lam_hi, n_steps)
+    w_cov = float(max(coverage_weight, 0.0))
+
+    best_obj = float("inf")
+    best_lam = 1.0
+    best_pin = float("nan")
+    best_gap50 = float("nan")
+    best_gap80 = float("nan")
+
+    for lam in lambdas:
+        adj = _apply_hb_location_scale(
+            calib_q,
+            quantiles=quantiles,
+            delta=delta,
+            lam=float(lam),
+        )
+        merged = calib_set[["unique_id", "ds", "y"]].merge(adj, on=["unique_id", "ds"], how="inner")
+        if merged.empty:
+            continue
+        pin = _pinball_mean(merged, quantiles=quantiles)
+        if not np.isfinite(pin):
+            continue
+        cov50 = coverage_rate(merged, 0.25, 0.75, 0.5)["Coverage@50"]
+        cov80 = coverage_rate(merged, 0.1, 0.9, 0.8)["Coverage@80"]
+        gap50 = abs(float(cov50) - 0.5)
+        gap80 = abs(float(cov80) - 0.8)
+        obj = float(pin + w_cov * (gap50 + gap80))
+        if obj < best_obj:
+            best_obj = obj
+            best_lam = float(lam)
+            best_pin = float(pin)
+            best_gap50 = float(gap50)
+            best_gap80 = float(gap80)
+
+    if not np.isfinite(best_obj):
+        return default
+    return {
+        "mode": "location_scale",
+        "delta": float(delta),
+        "lambda": float(best_lam),
+        "objective": float(best_obj),
+        "pinball_cal": float(best_pin),
+        "cov_gap50_cal": float(best_gap50),
+        "cov_gap80_cal": float(best_gap80),
+        "coverage_weight": float(w_cov),
+    }
+
+
+def _apply_hb_location_scale(
+    tsbhb_q: pd.DataFrame,
+    quantiles: list[float],
+    delta: float,
+    lam: float,
+) -> pd.DataFrame:
+    qcols = _qcols(quantiles)
+    if "q_0.5" not in tsbhb_q.columns:
+        return _enforce_monotonic_quantiles(tsbhb_q, quantiles)
+
+    out = tsbhb_q.copy()
+    q50 = out["q_0.5"].astype(float)
+    center = q50 + float(delta)
+    lam = float(max(lam, 1e-6))
+    for col in qcols:
+        if col not in out.columns:
+            continue
+        out[col] = center + lam * (out[col].astype(float) - q50)
+        out[col] = out[col].clip(lower=0.0)
+    return _enforce_monotonic_quantiles(out, quantiles)
+
+
+def _apply_hb_calibration(
+    tsbhb_q: pd.DataFrame,
+    quantiles: list[float],
+    calibration: Optional[dict[str, float | str]],
+) -> pd.DataFrame:
+    if not calibration:
+        return _enforce_monotonic_quantiles(tsbhb_q, quantiles)
+
+    mode = str(calibration.get("mode", "none")).lower()
+    if mode == "location_scale":
+        delta = float(calibration.get("delta", 0.0))
+        lam = float(calibration.get("lambda", 1.0))
+        return _apply_hb_location_scale(tsbhb_q, quantiles=quantiles, delta=delta, lam=lam)
+    return _enforce_monotonic_quantiles(tsbhb_q, quantiles)
+
+
+def _extract_sf_quantiles(sf_q: pd.DataFrame, model: str, quantiles: list[float]) -> pd.DataFrame:
+    rename_map = {
+        f"{model}": "q_0.5",
+        f"{model}-lo-80": "q_0.1",
+        f"{model}-hi-80": "q_0.9",
+        f"{model}-lo-50": "q_0.25",
+        f"{model}-hi-50": "q_0.75",
+    }
+    cols = [model, f"{model}-lo-80", f"{model}-hi-80", f"{model}-lo-50", f"{model}-hi-50", "unique_id", "ds"]
+    cols = [c for c in cols if c in sf_q.columns]
+    qcols = _qcols(quantiles)
+    if not cols:
+        out = pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
+        return out
+
+    out = sf_q[cols].copy().rename(columns=rename_map)
+    for c in qcols:
+        if c not in out.columns:
+            out[c] = np.nan
+    out = _enforce_monotonic_quantiles(out, quantiles=quantiles)
+    out["model"] = model
+    return out[["model", "unique_id", "ds"] + qcols]
+
+
+def _predict_non_hb_prob_models_once(
+    train_df: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    quantiles: list[float],
+    baseline_mode: str = "full",
+) -> pd.DataFrame:
+    qcols = _qcols(quantiles)
+    if eval_df.empty:
+        return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
+    if baseline_mode not in {"full", "hurdle_only", "hb_only"}:
+        raise ValueError("baseline_mode must be one of: full, hurdle_only, hb_only.")
+    if baseline_mode == "hb_only":
+        return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
+
+    frames: list[pd.DataFrame] = []
+    if baseline_mode == "full":
+        eval_h = eval_df["unique_id"].value_counts()
+        sf_q = fit_predict_baselines(train_df, eval_h, freq="D", probabilistic=True, levels=[80, 50])
+        arima = _extract_sf_quantiles(sf_q, "AutoARIMA", quantiles)
+        theta = _extract_sf_quantiles(sf_q, "AutoTheta", quantiles)
+        frames.extend([arima, theta])
+
+    local_params = fit_hurdle_local_lognormal(train_df)
+    local_q = predict_hurdle_local_lognormal(local_params, eval_df, quantiles=quantiles)
+    for c in qcols:
+        if c not in local_q.columns:
+            local_q[c] = np.nan
+    local_q = _enforce_monotonic_quantiles(local_q, quantiles=quantiles)
+    local_q["model"] = "Hurdle-Local-LogNormal"
+    local_q = local_q[["model", "unique_id", "ds"] + qcols]
+
+    global_params = fit_hurdle_global_lognormal(train_df)
+    global_q = predict_hurdle_global_lognormal(global_params, eval_df, quantiles=quantiles)
+    for c in qcols:
+        if c not in global_q.columns:
+            global_q[c] = np.nan
+    global_q = _enforce_monotonic_quantiles(global_q, quantiles=quantiles)
+    global_q["model"] = "Hurdle-Global-LogNormal"
+    global_q = global_q[["model", "unique_id", "ds"] + qcols]
+
+    frames.extend([local_q, global_q])
+    return pd.concat(frames, ignore_index=True)
+
+
+def _predict_prob_models_once(
+    train_df: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    quantiles: list[float],
+    hb_group_labels: pd.Series | None = None,
+    hb_bootstrap_draws: int = 0,
+    hb_bootstrap_seed: int | None = None,
+    hb_use_hyper_uncertainty: bool = True,
+    hb_group_shrink_strength: float = 0.0,
+    hb_item_variance_mode: str = "group",
+    hb_variance_prior_df: float = 20.0,
+    hb_calibration: Optional[dict[str, float | str]] = None,
+    baseline_mode: str = "full",
+) -> pd.DataFrame:
+    qcols = _qcols(quantiles)
+    if eval_df.empty:
+        return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
+
+    params = fit_tsb_hb(
+        train_df,
+        group_labels=hb_group_labels,
+        bootstrap_draws=hb_bootstrap_draws,
+        bootstrap_seed=hb_bootstrap_seed,
+        group_shrink_strength=hb_group_shrink_strength,
+        item_variance_mode=hb_item_variance_mode,
+        item_variance_shrink_strength=hb_variance_prior_df,
+    )
+    tsbhb_q = predict_tsb_hb(
+        params,
+        eval_df,
+        quantiles=quantiles,
+        n_samples=2000,
+        include_hyper_uncertainty=hb_use_hyper_uncertainty,
+    )
+    for c in qcols:
+        if c not in tsbhb_q.columns:
+            tsbhb_q[c] = np.nan
+    tsbhb_q = _apply_hb_calibration(tsbhb_q, quantiles=quantiles, calibration=hb_calibration)
+    tsbhb_q["model"] = "TSB-HB"
+    tsbhb_q = tsbhb_q[["model", "unique_id", "ds"] + qcols]
+
+    non_hb = _predict_non_hb_prob_models_once(
+        train_df,
+        eval_df,
+        quantiles,
+        baseline_mode=baseline_mode,
+    )
+    return pd.concat([tsbhb_q, non_hb], ignore_index=True)
 
 
 def _rolling_forecast_over_eval_probabilistic(
@@ -35,16 +375,10 @@ def _rolling_forecast_over_eval_probabilistic(
     eval_set: pd.DataFrame,
     h: int,
 ) -> pd.DataFrame:
-    """Forecast the full eval segment by chaining blocks of size h (Probabilistic Version).
-
-    Pred-only chaining: we never refit and we never peek at realized evaluation targets.
-    To move beyond the first h steps, we append the model's own point predictions as context.
-    """
     if h <= 0:
         raise ValueError("h must be positive.")
 
     hist = init_hist[["unique_id", "ds", "y"]].copy()
-
     eval_idx = eval_set[["unique_id", "ds", "y"]].copy()
     eval_idx["k"] = eval_idx.groupby("unique_id").cumcount()
     k_max = int(eval_idx["k"].max()) if not eval_idx.empty else -1
@@ -54,9 +388,7 @@ def _rolling_forecast_over_eval_probabilistic(
     all_pred_cols = [base_model_col] + quantile_cols
 
     for _ in range(n_blocks):
-        # Predict the next h steps for ALL series
         block_fcst = nf.predict(df=hist).reset_index()
-        
         for col in all_pred_cols:
             if col not in block_fcst.columns:
                 raise KeyError(f"Forecast output missing expected column '{col}'. Got: {list(block_fcst.columns)}")
@@ -64,89 +396,348 @@ def _rolling_forecast_over_eval_probabilistic(
         block_out = block_fcst[["unique_id", "ds"] + all_pred_cols].copy()
         preds.append(block_out)
 
-        # Advance the context to support the next block using the point prediction
         advance = block_out.rename(columns={base_model_col: "y"})[["unique_id", "ds", "y"]].copy()
         advance["y"] = advance["y"].fillna(0.0)
-
         hist = pd.concat([hist, advance], ignore_index=True).sort_values(["unique_id", "ds"]).reset_index(drop=True)
 
     if not preds:
         return pd.DataFrame(columns=["unique_id", "ds"] + all_pred_cols)
     all_preds = pd.concat(preds, ignore_index=True)
-    # Keep only the timestamps that exist in the evaluation set
     return eval_set[["unique_id", "ds"]].merge(all_preds, on=["unique_id", "ds"], how="left")
 
 
-def plot_calibration_curve(eval_merged: pd.DataFrame, quantiles: list[float], out_dir: Path):
-    """繪製可靠度圖 (Calibration Curve / Reliability Diagram)"""
+def _predict_deepar_fixed(
+    init_set: pd.DataFrame,
+    eval_set: pd.DataFrame,
+    quantiles: list[float],
+    horizon: int,
+    input_size: int,
+    start_padding_enabled: bool,
+    max_steps: int,
+) -> pd.DataFrame:
+    if NeuralForecast is None:
+        raise ImportError("DeepAR requested but neuralforecast is not available in this environment.")
+
+    loss = DistributionLoss(distribution="NegativeBinomial", level=[50, 80])
+    models = [
+        DeepAR(
+            h=horizon,
+            input_size=max(int(input_size), 1),
+            loss=loss,
+            scaler_type="robust",
+            start_padding_enabled=start_padding_enabled,
+            max_steps=max_steps,
+        )
+    ]
+    nf = NeuralForecast(models=models, freq="D")
+    nf.fit(df=init_set[["unique_id", "ds", "y"]])
+
+    base_col = "DeepAR"
+    q_cols = ["DeepAR-lo-80", "DeepAR-hi-80", "DeepAR-lo-50", "DeepAR-hi-50"]
+    nf_preds = _rolling_forecast_over_eval_probabilistic(
+        nf=nf,
+        base_model_col=base_col,
+        quantile_cols=q_cols,
+        init_hist=init_set,
+        eval_set=eval_set,
+        h=horizon,
+    )
+
+    rename_nf = {
+        "DeepAR": "q_0.5",
+        "DeepAR-lo-80": "q_0.1",
+        "DeepAR-hi-80": "q_0.9",
+        "DeepAR-lo-50": "q_0.25",
+        "DeepAR-hi-50": "q_0.75",
+    }
+    qcols = _qcols(quantiles)
+    out = nf_preds.rename(columns=rename_nf)
+    for c in qcols:
+        if c not in out.columns:
+            out[c] = np.nan
+    out = _enforce_monotonic_quantiles(out, quantiles=quantiles)
+    out["model"] = "DeepAR"
+    return out[["model", "unique_id", "ds"] + qcols]
+
+
+def plot_calibration_curve(eval_merged: pd.DataFrame, quantiles: list[float], out_dir: Path) -> None:
     plt.figure(figsize=(8, 8))
-    plt.plot([0, 1], [0, 1], 'k--', label="Perfect Calibration")
-    
+    plt.plot([0, 1], [0, 1], "k--", label="Perfect Calibration")
+
     for model, dfm in eval_merged.groupby("model"):
         emp_coverages = []
         for q in quantiles:
             col = f"q_{q}"
+            if col not in dfm.columns:
+                emp_coverages.append(np.nan)
+                continue
             emp_cov = (dfm["y"] <= dfm[col]).mean()
             emp_coverages.append(emp_cov)
-            
-        plt.plot(quantiles, emp_coverages, marker='o', label=model)
-        
+        plt.plot(quantiles, emp_coverages, marker="o", label=model)
+
     plt.xlabel("Nominal Coverage (Quantile)")
     plt.ylabel("Empirical Coverage")
     plt.title("Calibration Curve (Reliability Diagram)")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(out_dir / "calibration_curve.png", dpi=300, bbox_inches='tight')
+    plt.savefig(out_dir / "calibration_curve.png", dpi=300, bbox_inches="tight")
     plt.close()
 
 
-def plot_pit_histogram(eval_merged: pd.DataFrame, quantiles: list[float], out_dir: Path):
-    """繪製 PIT (Probability Integral Transform) 直方圖"""
+def plot_pit_histogram(eval_merged: pd.DataFrame, quantiles: list[float], out_dir: Path) -> None:
     models = eval_merged["model"].unique()
+    if len(models) == 0:
+        return
+
     fig, axes = plt.subplots(1, len(models), figsize=(5 * len(models), 4), sharey=True)
-    if len(models) == 1: axes = [axes]
-    
+    if len(models) == 1:
+        axes = [axes]
+
     bins = [0.0] + quantiles + [1.0]
-    
     for ax, model in zip(axes, models):
         dfm = eval_merged[eval_merged["model"] == model].copy()
-        pit_values = []
-        
-        for _, row in dfm.iterrows():
-            y = row["y"]
-            if y <= row[f"q_{quantiles[0]}"]:
-                pit_values.append(quantiles[0] / 2)
-            elif y > row[f"q_{quantiles[-1]}"]:
-                pit_values.append((1.0 + quantiles[-1]) / 2)
-            else:
-                for i in range(len(quantiles) - 1):
-                    if row[f"q_{quantiles[i]}"] < y <= row[f"q_{quantiles[i+1]}"]:
-                        pit_values.append((quantiles[i] + quantiles[i+1]) / 2)
-                        break
-                        
-        sns.histplot(pit_values, bins=bins, stat="density", ax=ax, color="skyblue")
-        ax.axhline(1.0, color='r', linestyle='--', label="Uniform (Ideal)")
+        pits = pit_values(dfm, quantiles=quantiles)
+        ax.hist(pits, bins=bins, density=True, color="skyblue", alpha=0.85)
+        ax.axhline(1.0, color="r", linestyle="--", label="Uniform (Ideal)")
         ax.set_title(f"PIT Histogram: {model}")
         ax.set_xlabel("PIT Value")
         ax.legend()
-        
+
     plt.tight_layout()
-    plt.savefig(out_dir / "pit_histogram.png", dpi=300, bbox_inches='tight')
+    plt.savefig(out_dir / "pit_histogram.png", dpi=300, bbox_inches="tight")
     plt.close()
 
 
-def main() -> None:
+def _coverage_summary(eval_merged: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for model, dfm in eval_merged.groupby("model"):
+        cov50 = coverage_rate(dfm, 0.25, 0.75, 0.5)
+        cov80 = coverage_rate(dfm, 0.1, 0.9, 0.8)
+        row = {"model": model, "n_obs": int(len(dfm))}
+        row.update(cov50)
+        row.update(cov80)
+        row["CoverageGap@50"] = float(abs(cov50["Coverage@50"] - 0.50))
+        row["CoverageGap@80"] = float(abs(cov80["Coverage@80"] - 0.80))
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "model",
+                "n_obs",
+                "Coverage@50",
+                "AIW@50",
+                "Coverage@80",
+                "AIW@80",
+                "CoverageGap@50",
+                "CoverageGap@80",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def _cold_start_bucket(init_pos: int) -> str:
+    v = int(init_pos)
+    if v <= 1:
+        return "CS_0_1"
+    if v <= 3:
+        return "CS_2_3"
+    if v <= 5:
+        return "CS_4_5"
+    if v <= 10:
+        return "CS_6_10"
+    return "CS_11_plus"
+
+
+def _build_slice_features(init_set: pd.DataFrame) -> pd.DataFrame:
+    tmp = init_set.copy()
+    tmp["occ"] = (tmp["y"] > 0).astype(int)
+    base = (
+        tmp.groupby("unique_id", as_index=False)
+        .agg(init_len=("ds", "nunique"), init_pos=("occ", "sum"))
+    )
+    base["init_pos"] = base["init_pos"].astype(int)
+    base["cold_start_bin"] = base["init_pos"].map(_cold_start_bucket)
+
+    feats = compute_adi_cv2(init_set)
+    if not feats.empty:
+        feats["category"] = feats.apply(classify_adi_cv2, axis=1)
+        base = base.merge(feats[["unique_id", "adi", "cv_sq", "category"]], on="unique_id", how="left")
+    else:
+        base["adi"] = np.nan
+        base["cv_sq"] = np.nan
+        base["category"] = np.nan
+
+    base["category"] = base["category"].fillna("NoPositiveInit")
+    base["sparse_regime"] = np.where(
+        base["category"].isin(["Intermittent", "Lumpy"]),
+        "Sparse(Intermittent|Lumpy)",
+        "NonSparse(Smooth|Erratic)",
+    )
+    return base
+
+
+def _ordered_slice_values(slice_type: str, values: pd.Series) -> list[str]:
+    observed = [str(v) for v in values.dropna().unique().tolist()]
+    if slice_type == "regime":
+        order = ["Smooth", "Erratic", "Intermittent", "Lumpy", "NoPositiveInit"]
+        return [x for x in order if x in observed] + sorted([x for x in observed if x not in order])
+    if slice_type == "cold_start":
+        order = ["CS_0_1", "CS_2_3", "CS_4_5", "CS_6_10", "CS_11_plus"]
+        return [x for x in order if x in observed] + sorted([x for x in observed if x not in order])
+    if slice_type == "sparse":
+        order = ["NonSparse(Smooth|Erratic)", "Sparse(Intermittent|Lumpy)"]
+        return [x for x in order if x in observed] + sorted([x for x in observed if x not in order])
+    return sorted(observed)
+
+
+def _prob_metric_row(dfm: pd.DataFrame, quantiles: list[float]) -> dict[str, float]:
+    cov50 = coverage_rate(dfm, 0.25, 0.75, 0.5)
+    cov80 = coverage_rate(dfm, 0.1, 0.9, 0.8)
+    pin = evaluate_prob_models(dfm, quantiles=quantiles)
+    pin_mean = float(pin["pinball"].mean()) if not pin.empty else float("nan")
+    row = {
+        "Coverage@50": float(cov50["Coverage@50"]),
+        "AIW@50": float(cov50["AIW@50"]),
+        "Coverage@80": float(cov80["Coverage@80"]),
+        "AIW@80": float(cov80["AIW@80"]),
+        "CoverageGap@50": float(abs(float(cov50["Coverage@50"]) - 0.50)),
+        "CoverageGap@80": float(abs(float(cov80["Coverage@80"]) - 0.80)),
+        "pinball_mean": pin_mean,
+    }
+    row["GoalScore@80"] = row["AIW@80"] * (1.0 + row["CoverageGap@80"])
+
+    dfp = dfm[dfm["y"] > 0].copy()
+    row["n_obs_pos"] = int(len(dfp))
+    if dfp.empty:
+        row.update(
+            {
+                "Coverage@50_pos": np.nan,
+                "AIW@50_pos": np.nan,
+                "Coverage@80_pos": np.nan,
+                "AIW@80_pos": np.nan,
+                "CoverageGap@50_pos": np.nan,
+                "CoverageGap@80_pos": np.nan,
+                "pinball_mean_pos": np.nan,
+                "GoalScore@80_pos": np.nan,
+            }
+        )
+        return row
+
+    cov50_pos = coverage_rate(dfp, 0.25, 0.75, 0.5)
+    cov80_pos = coverage_rate(dfp, 0.1, 0.9, 0.8)
+    pin_pos = evaluate_prob_models(dfp, quantiles=quantiles)
+    pin_pos_mean = float(pin_pos["pinball"].mean()) if not pin_pos.empty else float("nan")
+
+    row.update(
+        {
+            "Coverage@50_pos": float(cov50_pos["Coverage@50"]),
+            "AIW@50_pos": float(cov50_pos["AIW@50"]),
+            "Coverage@80_pos": float(cov80_pos["Coverage@80"]),
+            "AIW@80_pos": float(cov80_pos["AIW@80"]),
+            "CoverageGap@50_pos": float(abs(float(cov50_pos["Coverage@50"]) - 0.50)),
+            "CoverageGap@80_pos": float(abs(float(cov80_pos["Coverage@80"]) - 0.80)),
+            "pinball_mean_pos": pin_pos_mean,
+        }
+    )
+    row["GoalScore@80_pos"] = row["AIW@80_pos"] * (1.0 + row["CoverageGap@80_pos"])
+    return row
+
+
+def _write_prob_slice_metrics(
+    init_set: pd.DataFrame,
+    eval_merged: pd.DataFrame,
+    quantiles: list[float],
+    out_dir: Path,
+    protocol: str,
+) -> None:
+    slice_feats = _build_slice_features(init_set)
+    eval_with_slices = eval_merged.merge(
+        slice_feats[["unique_id", "category", "sparse_regime", "cold_start_bin", "init_len", "init_pos"]],
+        on="unique_id",
+        how="left",
+    )
+    spec = [
+        ("regime", "category"),
+        ("sparse", "sparse_regime"),
+        ("cold_start", "cold_start_bin"),
+    ]
+    rows: list[dict[str, float | int | str]] = []
+    for slice_type, col in spec:
+        for slice_value in _ordered_slice_values(slice_type, eval_with_slices[col]):
+            block = eval_with_slices[eval_with_slices[col] == slice_value]
+            if block.empty:
+                continue
+            for model, dfm in block.groupby("model"):
+                if dfm.empty:
+                    continue
+                metric_row = _prob_metric_row(dfm, quantiles=quantiles)
+                rows.append(
+                    {
+                        "protocol": protocol,
+                        "slice_type": slice_type,
+                        "slice": slice_value,
+                        "model": model,
+                        "n_obs": int(len(dfm)),
+                        "n_series": int(dfm["unique_id"].nunique()),
+                        **metric_row,
+                    }
+                )
+    if rows:
+        pd.DataFrame(rows).to_csv(out_dir / "prob_slice_metrics.csv", index=False)
+
+
+def _pit_long(eval_merged: pd.DataFrame, quantiles: list[float]) -> pd.DataFrame:
+    rows = []
+    for model, dfm in eval_merged.groupby("model"):
+        pits = pit_values(dfm, quantiles=quantiles)
+        if pits.size == 0:
+            continue
+        rows.append(pd.DataFrame({"model": model, "pit": pits}))
+    if not rows:
+        return pd.DataFrame(columns=["model", "pit"])
+    return pd.concat(rows, ignore_index=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=default_data_file())
     ap.add_argument("--out", type=Path, default=default_out_dir())
     ap.add_argument("--seed", type=int, default=42)
-    # 增加與 run_deepar.py 一致的參數
     ap.add_argument("--min-len", type=int, default=30)
     ap.add_argument("--init-ratio", type=float, default=1.0 / 3.0)
-    ap.add_argument("--horizon", type=int, default=10, help="Block size for DeepAR rolling forecast")
+    ap.add_argument("--protocol", choices=["fixed", "walk_forward"], default="fixed")
+    ap.add_argument("--walk-step", type=int, default=1, help="Block size (steps) for walk-forward protocol.")
+    ap.add_argument("--baseline-mode", choices=["full", "hurdle_only", "hb_only"], default=None, help="Baseline set for both fixed and walk-forward: full=AutoARIMA/AutoTheta+hurdle, hurdle_only=hurdle+TSB-HB, hb_only=TSB-HB only.")
+    ap.add_argument("--hb-regime-aware", dest="hb_regime_aware", action="store_true", default=True, help="Use ADI/CV^2 regime-aware HB priors.")
+    ap.add_argument("--no-hb-regime-aware", dest="hb_regime_aware", action="store_false", help="Disable regime-aware priors and use global HB priors.")
+    ap.add_argument("--hb-group-shrink-strength", type=float, default=0.0, help="Extra shrink from group-level hyperparameters back to global hyperparameters (0 disables).")
+    ap.add_argument("--hb-online-update", dest="hb_online_update", action="store_true", default=True, help="Use online sufficient-statistics updates for TSB-HB in walk-forward.")
+    ap.add_argument("--no-hb-online-update", dest="hb_online_update", action="store_false", help="Disable online update and re-fit TSB-HB each walk-forward step.")
+    ap.add_argument("--hb-dynamic-occurrence", dest="hb_dynamic_occurrence", action="store_true", default=False, help="Enable discounted dynamic occurrence updates for TSB-HB in walk-forward.")
+    ap.add_argument("--no-hb-dynamic-occurrence", dest="hb_dynamic_occurrence", action="store_false", help="Disable dynamic occurrence updates.")
+    ap.add_argument("--hb-occ-discount", type=float, default=1.0, help="Discount factor for dynamic occurrence update (0<d<=1).")
+    ap.add_argument("--hb-item-variance-mode", choices=["group", "conjugate"], default="group", help="Process variance mode for size: group or conjugate.")
+    ap.add_argument("--hb-variance-prior-df", type=float, default=20.0, help="Prior degrees of freedom for conjugate variance model (larger = stronger shrinkage).")
+    ap.add_argument("--hb-bootstrap-draws", type=int, default=20, help="Bootstrap draws for TSB-HB hyperparameter uncertainty (fixed protocol).")
+    ap.add_argument("--hb-disable-hyper-uncertainty", action="store_true", help="Disable bootstrap hyperparameter uncertainty even when draws > 0.")
+    ap.add_argument("--hb-calibration-mode", choices=["none", "location_scale"], default="none", help="Optional post-hoc calibration for TSB-HB quantiles.")
+    ap.add_argument("--hb-calibration-ratio", type=float, default=0.20, help="Tail fraction of init_set reserved to fit calibration shifts.")
+    ap.add_argument("--hb-calibration-samples", type=int, default=1000, help="Monte Carlo samples when fitting calibration shifts.")
+    ap.add_argument("--hb-calibration-lambda-min", type=float, default=0.60, help="Lower bound for location-scale calibration lambda.")
+    ap.add_argument("--hb-calibration-lambda-max", type=float, default=1.20, help="Upper bound for location-scale calibration lambda.")
+    ap.add_argument("--hb-calibration-lambda-steps", type=int, default=13, help="Number of lambda grid points for location-scale calibration.")
+    ap.add_argument("--hb-calibration-coverage-weight", type=float, default=0.50, help="Penalty weight on coverage gaps when fitting location-scale calibration.")
+    ap.add_argument("--with-deepar", action="store_true", help="Include DeepAR baseline (fixed protocol only).")
+    ap.add_argument("--horizon", type=int, default=10, help="Block size for DeepAR rolling forecast.")
     ap.add_argument("--input-size", type=int, default=14)
     ap.add_argument("--start-padding-enabled", action="store_true", default=True)
-    args = ap.parse_args()
+    ap.add_argument("--max-steps", type=int, default=500, help="Max training steps for DeepAR.")
+    return ap
+
+
+def run(args: argparse.Namespace) -> None:
+    if args.protocol == "walk_forward" and args.with_deepar:
+        raise ValueError("--with-deepar is currently supported only for --protocol fixed.")
 
     set_seed(args.seed)
     out_dir: Path = args.out
@@ -154,130 +745,208 @@ def main() -> None:
 
     df_raw = load_online_retail(args.data)
     df = preprocess_online_retail(df_raw)
-    
-    # Ensure minimum history
-    df["t"] = df.groupby("unique_id").cumcount()
-    df["L"] = df.groupby("unique_id")["t"].transform("max") + 1
-    df = df[df["L"] >= args.min_len].copy()
-
     init_set, eval_set = train_eval_split_fixed_origin(df, init_ratio=args.init_ratio, min_len=args.min_len)
+    if eval_set.empty:
+        raise ValueError("Evaluation set is empty; verify split parameters and input data.")
 
-    QUANTILES = [0.10, 0.25, 0.50, 0.75, 0.90]
-
-    # ==========================================
-    # 1. TSB-HB Probabilistic Forecast
-    # ==========================================
-    print("Fitting TSB-HB...")
-    params = fit_tsb_hb(init_set)
-    tsbhb_q = predict_tsb_hb(params, eval_set, quantiles=QUANTILES, n_samples=2000)
-    tsbhb_q["model"] = "TSB-HB"
-
-    # ==========================================
-    # 2. StatsForecast Baselines (AutoARIMA/AutoTheta)
-    # ==========================================
-    print("Fitting StatsForecast baselines...")
-    eval_h = eval_set["unique_id"].value_counts()
-    sf_q = fit_predict_baselines(init_set, eval_h, freq="D", probabilistic=True, levels=[80, 50])
-    
-    cols_arima = ["AutoARIMA", "AutoARIMA-lo-80", "AutoARIMA-hi-80", "AutoARIMA-lo-50", "AutoARIMA-hi-50"]
-    cols_theta = ["AutoTheta", "AutoTheta-lo-80", "AutoTheta-hi-80", "AutoTheta-lo-50", "AutoTheta-hi-50"]
-    arima = sf_q[[c for c in cols_arima if c in sf_q.columns] + ["unique_id", "ds"]].copy()
-    theta = sf_q[[c for c in cols_theta if c in sf_q.columns] + ["unique_id", "ds"]].copy()
-    
-    rename_map = {
-        "AutoARIMA": "q_0.5", "AutoARIMA-lo-80": "q_0.1", "AutoARIMA-hi-80": "q_0.9",
-        "AutoARIMA-lo-50": "q_0.25", "AutoARIMA-hi-50": "q_0.75",
-        "AutoTheta": "q_0.5", "AutoTheta-lo-80": "q_0.1", "AutoTheta-hi-80": "q_0.9",
-        "AutoTheta-lo-50": "q_0.25", "AutoTheta-hi-50": "q_0.75",
-    }
-    arima = arima.rename(columns=rename_map)
-    theta = theta.rename(columns=rename_map)
-    arima["model"] = "AutoARIMA"
-    theta["model"] = "AutoTheta"
-
-    # ==========================================
-    # 3. NeuralForecast Baseline (DeepAR with Chaining)
-    # ==========================================
-    deepar_q_df = pd.DataFrame()
-    if NeuralForecast is not None:
-        print(f"Fitting DeepAR (Chaining with horizon={args.horizon})...")
-        # 採用 NegativeBinomial 或 Normal 皆可，此處設定輸出 [50, 80] levels 對應我們的 Quantiles
-        loss = DistributionLoss(distribution='NegativeBinomial', level=[50, 80])
-        models = [
-            DeepAR(
-                h=args.horizon, 
-                input_size=max(int(args.input_size), 1), 
-                loss=loss, 
-                scaler_type='robust', 
-                start_padding_enabled=args.start_padding_enabled,
-                max_steps=500
-            )
-        ]
-        nf = NeuralForecast(models=models, freq='D')
-        nf.fit(df=init_set[["unique_id", "ds", "y"]])
-
-        base_col = "DeepAR"
-        q_cols = ["DeepAR-lo-80", "DeepAR-hi-80", "DeepAR-lo-50", "DeepAR-hi-50"]
-        
-        # 執行包含機率欄位的滾動預測！
-        nf_preds = _rolling_forecast_over_eval_probabilistic(
-            nf=nf,
-            base_model_col=base_col,
-            quantile_cols=q_cols,
-            init_hist=init_set,
-            eval_set=eval_set,
-            h=args.horizon
+    qcols = _qcols(QUANTILES)
+    hb_group_labels = _build_regime_group_labels(init_set) if args.hb_regime_aware else None
+    hb_use_hyper_uncertainty = (not args.hb_disable_hyper_uncertainty) and (args.hb_bootstrap_draws > 0)
+    baseline_mode = args.baseline_mode or "full"
+    hb_variance_prior_df = float(max(args.hb_variance_prior_df, 2.1))
+    hb_calibration: Optional[dict[str, float | str]] = None
+    if args.hb_calibration_mode == "location_scale":
+        hb_calibration = _fit_hb_location_scale(
+            init_set=init_set,
+            quantiles=QUANTILES,
+            hb_regime_aware=bool(args.hb_regime_aware),
+            hb_group_shrink_strength=float(max(args.hb_group_shrink_strength, 0.0)),
+            hb_item_variance_mode=str(args.hb_item_variance_mode),
+            hb_variance_prior_df=hb_variance_prior_df,
+            hb_bootstrap_draws=max(int(args.hb_bootstrap_draws), 0),
+            hb_bootstrap_seed=args.seed,
+            hb_use_hyper_uncertainty=hb_use_hyper_uncertainty,
+            calibration_ratio=float(args.hb_calibration_ratio),
+            calibration_samples=max(int(args.hb_calibration_samples), 200),
+            lambda_min=float(args.hb_calibration_lambda_min),
+            lambda_max=float(args.hb_calibration_lambda_max),
+            lambda_steps=max(int(args.hb_calibration_lambda_steps), 2),
+            coverage_weight=float(max(args.hb_calibration_coverage_weight, 0.0)),
         )
+    if hb_calibration is not None:
+        pd.DataFrame(
+            [
+                {
+                    "model": "TSB-HB",
+                    "calibration_mode": str(hb_calibration.get("mode", args.hb_calibration_mode)),
+                    **hb_calibration,
+                }
+            ]
+        ).to_csv(out_dir / "hb_calibration_params.csv", index=False)
 
-        rename_nf = {
-            "DeepAR": "q_0.5",
-            "DeepAR-lo-80": "q_0.1", "DeepAR-hi-80": "q_0.9",
-            "DeepAR-lo-50": "q_0.25", "DeepAR-hi-50": "q_0.75",
-        }
-        deepar_q_df = nf_preds.rename(columns=rename_nf)[["unique_id", "ds"] + list(rename_nf.values())]
-        deepar_q_df["model"] = "DeepAR"
+    if args.protocol == "fixed":
+        all_q = _predict_prob_models_once(
+            init_set,
+            eval_set,
+            quantiles=QUANTILES,
+            hb_group_labels=hb_group_labels,
+            hb_bootstrap_draws=max(int(args.hb_bootstrap_draws), 0),
+            hb_bootstrap_seed=args.seed,
+            hb_use_hyper_uncertainty=hb_use_hyper_uncertainty,
+            hb_group_shrink_strength=float(max(args.hb_group_shrink_strength, 0.0)),
+            hb_item_variance_mode=str(args.hb_item_variance_mode),
+            hb_variance_prior_df=hb_variance_prior_df,
+            hb_calibration=hb_calibration,
+            baseline_mode=baseline_mode,
+        )
+        if args.with_deepar:
+            deepar_q = _predict_deepar_fixed(
+                init_set=init_set,
+                eval_set=eval_set,
+                quantiles=QUANTILES,
+                horizon=args.horizon,
+                input_size=args.input_size,
+                start_padding_enabled=args.start_padding_enabled,
+                max_steps=args.max_steps,
+            )
+            all_q = pd.concat([all_q, deepar_q], ignore_index=True)
+    else:
+        step_outputs = []
+        hb_state = None
+        if args.hb_online_update:
+            hb_state = initialize_online_tsb_hb(
+                init_set,
+                group_labels=hb_group_labels,
+                bootstrap_draws=0,
+                bootstrap_seed=args.seed,
+                group_shrink_strength=float(max(args.hb_group_shrink_strength, 0.0)),
+                dynamic_occurrence=bool(args.hb_dynamic_occurrence),
+                occurrence_discount=float(args.hb_occ_discount),
+                item_variance_mode=str(args.hb_item_variance_mode),
+                item_variance_shrink_strength=hb_variance_prior_df,
+            )
+        for frame in iter_walk_forward_frames(init_set, eval_set, step_size=args.walk_step):
+            if hb_state is not None:
+                tsbhb_q = predict_online_tsb_hb(
+                    hb_state,
+                    frame.target,
+                    quantiles=QUANTILES,
+                    n_samples=2000,
+                    include_hyper_uncertainty=False,
+                )
+                for c in qcols:
+                    if c not in tsbhb_q.columns:
+                        tsbhb_q[c] = np.nan
+                tsbhb_q = _apply_hb_calibration(
+                    tsbhb_q,
+                    quantiles=QUANTILES,
+                    calibration=hb_calibration,
+                )
+                tsbhb_q["model"] = "TSB-HB"
+                tsbhb_q = tsbhb_q[["model", "unique_id", "ds"] + qcols]
 
-    # ==========================================
-    # 4. Merge and Evaluate
-    # ==========================================
-    qcols = [f"q_{q}" for q in QUANTILES]
-    dfs_to_concat = [tsbhb_q, arima, theta]
-    if not deepar_q_df.empty:
-        dfs_to_concat.append(deepar_q_df)
+                non_hb_q = _predict_non_hb_prob_models_once(
+                    frame.history,
+                    frame.target,
+                    quantiles=QUANTILES,
+                    baseline_mode=baseline_mode,
+                )
+                step_q = pd.concat([tsbhb_q, non_hb_q], ignore_index=True)
+                hb_state = update_online_tsb_hb(hb_state, frame.target)
+            else:
+                step_q = _predict_prob_models_once(
+                    frame.history,
+                    frame.target,
+                    quantiles=QUANTILES,
+                    hb_group_labels=hb_group_labels,
+                    hb_bootstrap_draws=0,
+                    hb_bootstrap_seed=args.seed,
+                    hb_use_hyper_uncertainty=False,
+                    hb_group_shrink_strength=float(max(args.hb_group_shrink_strength, 0.0)),
+                    hb_item_variance_mode=str(args.hb_item_variance_mode),
+                    hb_variance_prior_df=hb_variance_prior_df,
+                    hb_calibration=hb_calibration,
+                    baseline_mode=baseline_mode,
+                )
+            step_outputs.append(step_q)
+        if not step_outputs:
+            all_q = pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
+        else:
+            all_q = pd.concat(step_outputs, ignore_index=True)
 
-    for df_ in dfs_to_concat:
-        for c in qcols:
-            if c not in df_.columns:
-                df_[c] = np.nan
-        df_.dropna(subset=["unique_id", "ds"], inplace=True)
+    all_q = all_q.sort_values(["model", "unique_id", "ds"]).reset_index(drop=True)
+    all_q_out = all_q.copy()
+    all_q_out.insert(0, "protocol", args.protocol)
+    all_q_out.to_csv(out_dir / "prob_quantiles.csv", index=False)
 
-    all_q = pd.concat([d[["model", "unique_id", "ds"] + qcols] for d in dfs_to_concat], ignore_index=True)
-    all_q.to_csv(out_dir / "prob_quantiles.csv", index=False)
+    eval_merged = eval_set[["unique_id", "ds", "y"]].merge(all_q, on=["unique_id", "ds"], how="inner")
+    if eval_merged.empty:
+        raise ValueError("Merged probabilistic evaluation frame is empty; no predictions matched evaluation timestamps.")
 
-    eval_merged = eval_set[["unique_id", "ds", "y"]].copy().merge(all_q, on=["unique_id", "ds"], how="inner")
-    
-    print("Generating Calibration Curve and PIT Histogram...")
     plot_calibration_curve(eval_merged, QUANTILES, out_dir)
     plot_pit_histogram(eval_merged, QUANTILES, out_dir)
 
-    print("Computing Pinball Loss and CRPS...")
-    rows = []
-    for model, dfm in eval_merged.groupby("model"):
-        model_pinballs = []
-        for q in QUANTILES:
-            col = f"q_{q}"
-            dfx = dfm.dropna(subset=[col]).copy()
-            err = dfx["y"] - dfx[col]
-            loss = np.maximum(q * err, (q - 1) * err).mean()
-            model_pinballs.append(loss)
-            rows.append({"model": model, "quantile": q, "pinball": float(loss)})
-        
-
-    pinball_df = pd.DataFrame(rows)
+    pinball_df = evaluate_prob_models(eval_merged, QUANTILES)
+    pinball_df.insert(0, "protocol", args.protocol)
     pinball_df.to_csv(out_dir / "prob_pinball.csv", index=False)
     pinball_df.to_csv(out_dir / "probabilistic_forecast_pinball_results.csv", index=False)
-    
+
+    coverage_df = _coverage_summary(eval_merged)
+    coverage_df.insert(0, "protocol", args.protocol)
+    coverage_df.to_csv(out_dir / "coverage_summary.csv", index=False)
+
+    eval_pos = eval_merged[eval_merged["y"] > 0].copy()
+    coverage_pos_df = _coverage_summary(eval_pos)
+    if not coverage_pos_df.empty:
+        coverage_pos_df = coverage_pos_df.rename(
+            columns={
+                "n_obs": "n_obs_pos",
+                "Coverage@50": "Coverage@50_pos",
+                "AIW@50": "AIW@50_pos",
+                "Coverage@80": "Coverage@80_pos",
+                "AIW@80": "AIW@80_pos",
+                "CoverageGap@50": "CoverageGap@50_pos",
+                "CoverageGap@80": "CoverageGap@80_pos",
+            }
+        )
+    coverage_pos_df.insert(0, "protocol", args.protocol)
+    coverage_pos_df.to_csv(out_dir / "coverage_summary_positive.csv", index=False)
+
+    pit_df = _pit_long(eval_merged, QUANTILES)
+    pit_df.insert(0, "protocol", args.protocol)
+    pit_df.to_csv(out_dir / "pit_values.csv", index=False)
+
+    pinball_mean = pinball_df.groupby(["protocol", "model"], as_index=False)["pinball"].mean().rename(columns={"pinball": "pinball_mean"})
+    pinball_pos_mean = pd.DataFrame(columns=["protocol", "model", "pinball_mean_pos"])
+    if not eval_pos.empty:
+        pinball_pos_df = evaluate_prob_models(eval_pos, QUANTILES)
+        if not pinball_pos_df.empty:
+            pinball_pos_df.insert(0, "protocol", args.protocol)
+            pinball_pos_mean = pinball_pos_df.groupby(["protocol", "model"], as_index=False)["pinball"].mean().rename(columns={"pinball": "pinball_mean_pos"})
+
+    prob_metrics = coverage_df.merge(pinball_mean, on=["protocol", "model"], how="left")
+    prob_metrics = prob_metrics.merge(coverage_pos_df, on=["protocol", "model"], how="left")
+    prob_metrics = prob_metrics.merge(pinball_pos_mean, on=["protocol", "model"], how="left")
+    prob_metrics["GoalScore@80"] = prob_metrics["AIW@80"] * (1.0 + prob_metrics["CoverageGap@80"])
+    if "AIW@80_pos" in prob_metrics.columns and "CoverageGap@80_pos" in prob_metrics.columns:
+        prob_metrics["GoalScore@80_pos"] = prob_metrics["AIW@80_pos"] * (1.0 + prob_metrics["CoverageGap@80_pos"])
+    prob_metrics.to_csv(out_dir / "prob_metrics.csv", index=False)
+    _write_prob_slice_metrics(
+        init_set=init_set,
+        eval_merged=eval_merged,
+        quantiles=QUANTILES,
+        out_dir=out_dir,
+        protocol=args.protocol,
+    )
+
     print("Evaluation complete. Results and plots saved to:", out_dir)
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    run(args)
+
 
 if __name__ == "__main__":
     main()

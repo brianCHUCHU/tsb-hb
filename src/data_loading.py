@@ -87,8 +87,8 @@ def convert_m5_wide_to_long(sales_wide_path: Path, output_path: Optional[Path] =
     elif 'item_id' in df_long.columns and 'store_id' in df_long.columns:
         df_long['series_id'] = df_long['item_id'] + '_' + df_long['store_id']
     
-    # Select and order columns
-    output_cols = ['series_id', 'item_id', 'store_id', 'd', 'sales']
+    # Select and order columns (keep hierarchy metadata when available)
+    output_cols = ['series_id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 'd', 'sales']
     output_cols = [c for c in output_cols if c in df_long.columns]
     df_long = df_long[output_cols].copy()
     
@@ -156,6 +156,7 @@ def preprocess_m5(
     df = df.dropna(subset=["ds"]).copy()
     df["ds"] = pd.to_datetime(df["ds"])
 
-    df = df[["unique_id", "ds", "y"]].sort_values(["unique_id", "ds"]).reset_index(drop=True)
+    meta_cols = [c for c in ["item_id", "dept_id", "cat_id", "store_id", "state_id"] if c in df.columns]
+    keep_cols = ["unique_id", "ds", "y"] + meta_cols
+    df = df[keep_cols].sort_values(["unique_id", "ds"]).reset_index(drop=True)
     return df
-

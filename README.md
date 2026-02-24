@@ -82,13 +82,20 @@ uv run python -m experiments.<script_name> [options]
 ### Script catalog
 
 - `run_point.py`
-	- **Purpose:** Fits the TSB-HB model and a suite of StatsForecast baselines for point forecasts.
+	- **Purpose:** Fits the TSB-HB model, StatsForecast baselines, and hurdle baselines (local/global LogNormal) for point forecasts.
 	- **Datasets:** Online Retail (default) and M5 via `--dataset m5`.
-	- **Highlights:** Generates `point_metrics.csv`, shrinkage plots (`fig_shrink_p.png`, `fig_shrink_size.png`), and `point_metrics_m5.csv` when running on M5.
+	- **Protocol options (Online Retail):** `--protocol fixed` (single fixed-origin fit) or `--protocol walk_forward` (sequential updates), configurable with `--walk-step`.
+	- **HB controls:** `--hb-regime-aware/--no-hb-regime-aware`, `--hb-group-shrink-strength`, `--hb-online-update/--no-hb-online-update`, `--hb-dynamic-occurrence/--no-hb-dynamic-occurrence`, `--hb-occ-discount`.
+	- **M5 hierarchy ablation:** `--m5-hierarchy-mode {off,on,ablation}` toggles hierarchy-aware pooling; ablation mode writes `m5_hierarchy_ablation.csv` with hierarchy vs non-hierarchy TSB-HB rows.
+	- **Highlights:** Generates `point_metrics.csv`, shrinkage plots (`fig_shrink_p.png`, `fig_shrink_size.png`), segmentation metrics (`segmentation_rmsse.csv`), slice diagnostics (`point_slice_metrics.csv`), and `point_metrics_m5.csv` on M5.
 - `run_prob.py`
-	- **Purpose:** Produces probabilistic forecasts (quantiles) for TSB-HB and AutoARIMA/AutoTheta baselines.
+	- **Purpose:** Produces probabilistic forecasts (quantiles) for TSB-HB, AutoARIMA/AutoTheta, and hurdle baselines (local/global LogNormal).
 	- **Datasets:** Online Retail only (M5 support not implemented).
-	- **Outputs:** `prob_quantiles.csv`, `prob_pinball.csv`, and `probabilistic_forecast_pinball_results.csv` in the chosen `--out` directory.
+	- **Protocol options:** `--protocol fixed` or `--protocol walk_forward` (`--walk-step` controls block size).
+	- **HB controls:** `--hb-regime-aware/--no-hb-regime-aware`, `--hb-group-shrink-strength`, `--hb-online-update/--no-hb-online-update`, `--hb-dynamic-occurrence/--no-hb-dynamic-occurrence`, `--hb-occ-discount`, `--hb-bootstrap-draws`, `--hb-disable-hyper-uncertainty`.
+	- **Calibration control:** `--hb-calibration-mode {none,location_scale}` with `--hb-calibration-ratio` and `--hb-calibration-samples` for optional post-hoc quantile calibration on TSB-HB.
+	- **Optional neural baseline:** DeepAR is available only for fixed protocol via `--with-deepar`.
+	- **Outputs:** `prob_quantiles.csv`, `prob_pinball.csv`, `probabilistic_forecast_pinball_results.csv`, `coverage_summary.csv`, `pit_values.csv`, `prob_metrics.csv`, `prob_slice_metrics.csv`, plus calibration/PIT plots.
 - `run_grid.py`
 	- **Purpose:** Sweeps across `(alpha_d, alpha_p)` combinations for the TSB baseline to compare against the TSB-HB reference.
 	- **Datasets:** Online Retail only.
@@ -98,9 +105,9 @@ uv run python -m experiments.<script_name> [options]
 	- **Datasets:** Online Retail only.
 	- **Outputs:** `ablation_metrics.csv` with ME/MAE/RMSE/RMSSE per variant.
 - `run_coverage_pit.py`
-	- **Purpose:** Evaluates interval coverage and probability integral transform statistics for probabilistic forecasts.
+	- **Purpose:** Compatibility wrapper for probabilistic diagnostics; delegates to `run_prob.py` so coverage/PIT use the same shared pipeline.
 	- **Datasets:** Online Retail only.
-	- **Outputs:** `coverage_summary.csv` (coverage & interval widths) and `pit_values.csv` for histogram diagnostics.
+	- **Outputs:** Same as `run_prob.py` (including `coverage_summary.csv` and `pit_values.csv`).
 - `run_deepar.py`
 	- **Purpose:** Optional neural benchmark using `neuralforecast`’s AutoDeepAR across configurable horizons.
 	- **Datasets:** Online Retail only (subset sampling controlled via CLI flags).
@@ -109,6 +116,82 @@ uv run python -m experiments.<script_name> [options]
 ## Outputs
 
 By default, each experiment writes results, diagnostics, and plots into `outputs/`. Clean the directory between runs if you need a fresh slate, or override `--out` with a dedicated subdirectory for reproducibility.
+
+### Configurable batch runner
+
+For the current v2 setup (group shrink + dynamic occurrence + optional probabilistic calibration), use:
+
+```bash
+bash scripts/experiments/run_v2_suite.sh scripts/experiments/config.v2.env
+```
+
+Edit `scripts/experiments/config.v2.env` to toggle protocol/dataset runs and all HB switches from one place.
+
+## Latest benchmark snapshot (2026-02-24, DeepAR excluded)
+
+Source run directory:
+- `outputs/nightly_full_live_20260224_022743`
+
+Closest statistical comparator is `Hurdle-Local-LogNormal`; deltas below are `TSB-HB - Hurdle-Local-LogNormal`.
+
+### Online Retail point forecasting
+
+| Protocol | TSB-HB MAE | TSB-HB RMSE | TSB-HB WRMSSE | dMAE | dRMSE | dWRMSSE |
+|---|---:|---:|---:|---:|---:|---:|
+| fixed | 5.7665 | 17.6934 | 1.1769 | -0.2266 | -0.0643 | -0.0016 |
+| walk_forward | 5.5853 | 17.2619 | 1.1504 | -0.1304 | -0.0268 | +0.0006 |
+
+Takeaway:
+- Fixed protocol: TSB-HB is the best WRMSSE among non-neural baselines in this run.
+- Walk protocol: TSB-HB improves MAE/RMSE vs Hurdle-Local but is nearly tied on WRMSSE.
+
+### Online Retail probabilistic forecasting (`@80`)
+
+| Protocol | dPinball | dCoverage@80 | dAIW@80 | dGoalScore@80 |
+|---|---:|---:|---:|---:|
+| fixed | +0.0028 | +0.0000 | -0.5087 | -0.5599 |
+| walk_forward | +0.0040 | -0.0005 | -0.2901 | -0.3257 |
+
+Positive-only (`y>0`) deltas:
+- fixed: `dPinball_pos=+0.0582`, `dCoverage@80_pos=+0.0001`, `dAIW@80_pos=-1.2509`, `dGoalScore@80_pos=-1.4772`
+- walk_forward: `dPinball_pos=+0.0406`, `dCoverage@80_pos=-0.0018`, `dAIW@80_pos=-0.7115`, `dGoalScore@80_pos=-0.7858`
+
+Takeaway:
+- TSB-HB gives sharper intervals (smaller AIW) at nearly the same coverage.
+- Pinball remains slightly worse than Hurdle-Local overall and on positive-only slices.
+
+### M5 point ablation (hierarchy on/off)
+
+| Model | MAE | RMSE | WRMSSE |
+|---|---:|---:|---:|
+| TSB-HB-NoHierarchy | 1.1771 | 2.8286 | 1.1038 |
+| TSB-HB-Hierarchy | 1.1824 | 2.8608 | 1.1119 |
+| Hurdle-Local-LogNormal | 1.1913 | 2.8272 | 1.1015 |
+
+Takeaway:
+- In this run, M5 hierarchy does not improve TSB-HB point metrics; keep hierarchy as an ablation switch instead of a default claim.
+
+### Calibration ablation (`none` vs `location_scale`, fixed)
+
+For TSB-HB, `location_scale` relative to `none`:
+- `pinball_mean: +0.0483`
+- `Coverage@80: -0.0844` (closer to nominal 0.8)
+- `AIW@80: -3.6779`
+- `GoalScore@80: -4.6280`
+- positive-only `pinball_mean_pos: +0.3064`, `Coverage@80_pos: -0.1275`, `AIW@80_pos: -7.5019`
+
+Takeaway:
+- `location_scale` strongly narrows intervals and moves unconditional coverage toward nominal, but degrades pinball (especially positive-only).
+- Default recommendation remains `--hb-calibration-mode none`; use `location_scale` only as a controlled calibration ablation.
+
+### Current claim boundary
+
+Supported by current evidence:
+- TSB-HB is a strong point baseline and often slightly better than Hurdle-Local in fixed and sparse/cold-start slices.
+- TSB-HB provides sharper probabilistic intervals at matched or near-matched coverage.
+
+Not yet supported as a strong claim:
+- TSB-HB universally outperforming Hurdle-Local on probabilistic accuracy (pinball), especially conditional on `y>0`.
 
 ## Reference
 
