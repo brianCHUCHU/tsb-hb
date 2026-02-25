@@ -172,144 +172,120 @@ def figure2_cold_start_shrinkage(data_path: Path, out_path: Path):
 
 
 def figure3_fan_chart_uai(data_path: Path, out_path: Path):
-    """Figure 3: 扇形圖風格的不確定性量化 (Fan Chart) - 2x2 四張小圖.
-    展示 2 條 Intermittent + 2 條 Lumpy，多層機率區間 (50%, 80%, 95%)。
+    """Figure 2: Probabilistic Fan Charts across Intermittency Regimes.
+    2x2: 2 Intermittent (top row) + 2 Lumpy (bottom row).
+    Fixed-origin split; 50%, 80%, 95% prediction intervals; Demand Intensity; Training & True Demand.
     """
     df_raw = load_online_retail(data_path)
     df = preprocess_online_retail(df_raw)
     init_set, eval_set = train_eval_split_fixed_origin(df, init_ratio=1/3, min_len=30)
-    
-    # 選擇展示類別並篩選合適長度的序列
+
     from metrics import compute_adi_cv2, classify_adi_cv2
+
     feats = compute_adi_cv2(init_set)
-    feats['category'] = feats.apply(classify_adi_cv2, axis=1)
-    
-    # 計算評估長度（避免太長的序列影響視覺效果）
-    eval_lengths = eval_set.groupby('unique_id').size()
-    feats = feats.merge(eval_lengths.rename('eval_len'), left_on='unique_id', right_index=True, how='left')
-    
-    # 篩選：評估長度在 30-80 天之間 + CV² > 0（有變異性）
+    feats["category"] = feats.apply(classify_adi_cv2, axis=1)
+    eval_lengths = eval_set.groupby("unique_id").size()
+    feats = feats.merge(eval_lengths.rename("eval_len"), left_on="unique_id", right_index=True, how="left")
     feats_filtered = feats[
-        (feats['eval_len'] >= 30) & 
-        (feats['eval_len'] <= 80) & 
-        (feats['cv_sq'] > 0)
+        (feats["eval_len"] >= 30) & (feats["eval_len"] <= 80) & (feats["cv_sq"] > 0)
     ].copy()
-    
-    # 選擇 2 條 Intermittent
-    inter_candidates = feats_filtered[feats_filtered['category'] == 'Intermittent']
-    if len(inter_candidates) >= 2:
-        inter_items = inter_candidates.nsmallest(2, 'eval_len')['unique_id'].tolist()
-    else:
-        inter_items = feats[feats['category'] == 'Intermittent'].head(2)['unique_id'].tolist()
-    
-    # 選擇 2 條 Lumpy
-    lumpy_candidates = feats_filtered[feats_filtered['category'] == 'Lumpy']
-    if len(lumpy_candidates) >= 2:
-        lumpy_items = lumpy_candidates.nsmallest(2, 'eval_len')['unique_id'].tolist()
-    else:
-        lumpy_items = feats[feats['category'] == 'Lumpy'].head(2)['unique_id'].tolist()
-    
-    # 排列：[Inter1, Inter2, Lumpy1, Lumpy2]
+
+    inter_candidates = feats_filtered[feats_filtered["category"] == "Intermittent"]
+    inter_items = (
+        inter_candidates.nsmallest(2, "eval_len")["unique_id"].tolist()
+        if len(inter_candidates) >= 2
+        else feats[feats["category"] == "Intermittent"].head(2)["unique_id"].tolist()
+    )
+    lumpy_candidates = feats_filtered[feats_filtered["category"] == "Lumpy"]
+    lumpy_items = (
+        lumpy_candidates.nsmallest(2, "eval_len")["unique_id"].tolist()
+        if len(lumpy_candidates) >= 2
+        else feats[feats["category"] == "Lumpy"].head(2)["unique_id"].tolist()
+    )
     selected_items = inter_items + lumpy_items
     if len(selected_items) < 4:
-        print(f"Warning: Only found {len(selected_items)} suitable items")
-        selected_items = feats['unique_id'].head(4).tolist()
-    
-    # Fit 模型
-    params = fit_tsb_hb(init_set)
+        selected_items = (selected_items + feats["unique_id"].head(4).tolist())[:4]
+
+    group_labels = feats.set_index("unique_id")["category"].astype(str)
+    params = fit_tsb_hb(init_set, group_labels=group_labels, item_variance_mode="conjugate")
     quantiles = [0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975]
-    
-    # 創建 2x2 網格
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     axes = axes.flatten()
-    fan_colors = ["#0D47A1", "#1976D2", "#42A5F5", "#BBDEFB"]  # 由深到淺
-    
+    fan_colors = ["#0D47A1", "#1976D2", "#42A5F5", "#BBDEFB"]
+
     for idx, item_id in enumerate(selected_items[:4]):
         ax = axes[idx]
-        item_init = init_set[init_set['unique_id'] == item_id].copy()
-        item_eval = eval_set[eval_set['unique_id'] == item_id].copy()
-        
+        item_init = init_set[init_set["unique_id"] == item_id].copy()
+        item_eval = eval_set[eval_set["unique_id"] == item_id].copy()
         if item_eval.empty:
-            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
             continue
-        
-        # 獲取機率預測
-        fcst = predict_tsb_hb(params, item_eval, quantiles=quantiles, n_samples=3000)
-        
-        # 計算 Demand Intensity (Mean)
-        p_i = params.p_posterior.get(item_id, 0)
-        mu_i = params.shrunk_mean_log.get(item_id, 0)
-        y_mean = p_i * np.exp(mu_i + params.sigma_sq_process / 2.0)
-        
-        # 判斷是否使用對數刻度（當最大需求 > 100 時）
-        y_max = max(item_init['y'].max(), item_eval['y'].max())
+
+        fcst = predict_tsb_hb(params, item_eval, quantiles=quantiles)
+        sigma_i = float(params.sigma_sq_process.get(item_id, params.sigma_sq_process.mean()))
+        p_i = float(params.p_posterior.get(item_id, 0))
+        mu_i = float(params.shrunk_mean_log.get(item_id, 0))
+        y_mean = p_i * np.exp(mu_i + sigma_i / 2.0)
+
+        y_max = max(item_init["y"].max(), item_eval["y"].max())
         use_log = y_max > 100
-        
-        # 1. 繪製觀測值
-        if use_log:
-            # 對數刻度：加小量避免 log(0)
-            train_y = item_init['y'].values + 0.1
-            eval_y = item_eval['y'].values + 0.1
-            ax.plot(item_init['ds'], train_y, 'o-', color='#999999', alpha=0.4, 
-                   markersize=3, linewidth=0.8, label='Training')
-            ax.scatter(item_eval['ds'], eval_y, color='black', s=12, zorder=5, label='True Demand')
-            ax.set_yscale('log')
-            ax.set_ylabel('Demand (log scale)', fontsize=10)
-        else:
-            ax.plot(item_init['ds'], item_init['y'], 'o-', color='#999999', alpha=0.4, 
-                   markersize=3, linewidth=0.8, label='Training')
-            ax.scatter(item_eval['ds'], item_eval['y'], color='black', s=12, zorder=5, label='True Demand')
-            ax.set_ylabel('Demand Units', fontsize=10)
-        
-        # 2. 繪製扇形區間 (Fan Bands)
         fcst_adj = fcst.copy()
         if use_log:
             for q in quantiles:
-                fcst_adj[f'q_{q}'] = fcst[f'q_{q}'] + 0.1
-        
-        # 95% Interval (最淺)
-        ax.fill_between(fcst_adj['ds'], fcst_adj['q_0.025'], fcst_adj['q_0.975'], 
-                       color=fan_colors[3], alpha=0.3, label='95% Interval')
-        # 80% Interval
-        ax.fill_between(fcst_adj['ds'], fcst_adj['q_0.1'], fcst_adj['q_0.9'], 
-                       color=fan_colors[2], alpha=0.5, label='80% Interval')
-        # 50% Interval (最深)
-        ax.fill_between(fcst_adj['ds'], fcst_adj['q_0.25'], fcst_adj['q_0.75'], 
-                       color=fan_colors[1], alpha=0.6, label='50% Interval')
-        
-        # 3. 繪製需求強度 (Mean Intensity)
+                fcst_adj[f"q_{q}"] = fcst[f"q_{q}"].values + 0.1
+
+        split_date = item_init["ds"].iloc[-1] if len(item_init) > 0 else None
+
+        # 1. Fan bands (eval period only) — draw first so they sit behind
+        ax.fill_between(
+            fcst_adj["ds"], fcst_adj["q_0.025"], fcst_adj["q_0.975"],
+            color=fan_colors[3], alpha=0.3, label="95% interval",
+        )
+        ax.fill_between(
+            fcst_adj["ds"], fcst_adj["q_0.1"], fcst_adj["q_0.9"],
+            color=fan_colors[2], alpha=0.5, label="80% interval",
+        )
+        ax.fill_between(
+            fcst_adj["ds"], fcst_adj["q_0.25"], fcst_adj["q_0.75"],
+            color=fan_colors[1], alpha=0.6, label="50% interval",
+        )
+        # 2. Demand Intensity (eval)
         y_mean_plot = y_mean + 0.1 if use_log else y_mean
-        ax.plot(fcst['ds'], [y_mean_plot]*len(fcst), color=fan_colors[0], 
-               lw=2.5, label='Demand Intensity', zorder=4)
-        
-        # 4. 裝飾與格式
-        if len(item_init) > 0:
-            ax.axvline(item_init['ds'].iloc[-1], color='#27ae60', ls='--', 
-                      lw=1.5, alpha=0.7, label='Train/Eval split')
-        
-        category = feats[feats['unique_id'] == item_id]['category'].values[0] if item_id in feats['unique_id'].values else 'Unknown'
-        adi = feats[feats['unique_id'] == item_id]['adi'].values[0] if item_id in feats['unique_id'].values else 0
-        cv2 = feats[feats['unique_id'] == item_id]['cv_sq'].values[0] if item_id in feats['unique_id'].values else 0
-        
-        title = f"{category}: Item {item_id}\n(ADI={adi:.2f}, CV²={cv2:.2f})"
-        ax.set_title(title, loc='left', fontweight='bold', fontsize=10)
-        ax.set_xlabel('Date', fontsize=9)
-        
-        # 格式化日期軸
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        ax.tick_params(axis='x', rotation=30, labelsize=8)
-        ax.tick_params(axis='y', labelsize=8)
-        
-        # 只在第一張子圖顯示圖例
+        ax.plot(fcst["ds"], [y_mean_plot] * len(fcst), color=fan_colors[0], lw=2.5, label="Demand Intensity", zorder=4)
+        # 3. Training (train period)
+        if use_log:
+            train_y = item_init["y"].values + 0.1
+            ax.plot(item_init["ds"], train_y, "o-", color="#999999", alpha=0.4, markersize=3, linewidth=0.8, label="Training")
+            ax.set_yscale("log")
+            ax.set_ylabel("Demand (log scale)", fontsize=10)
+        else:
+            ax.plot(item_init["ds"], item_init["y"], "o-", color="#999999", alpha=0.4, markersize=3, linewidth=0.8, label="Training")
+            ax.set_ylabel("Demand Units", fontsize=10)
+        # 4. True Demand (eval) — on top
+        ax.scatter(item_eval["ds"], item_eval["y"] + (0.1 if use_log else 0), color="black", s=14, zorder=5, label="True Demand")
+        # 5. Train/Eval split
+        if split_date is not None:
+            ax.axvline(split_date, color="#27ae60", ls="--", lw=1.5, alpha=0.7, label="Train/Eval split")
+
+        row = feats[feats["unique_id"] == item_id]
+        category = row["category"].values[0] if len(row) else "Unknown"
+        adi = float(row["adi"].values[0]) if len(row) else 0
+        cv_sq = float(row["cv_sq"].values[0]) if len(row) else 0
+        cv_display = np.sqrt(cv_sq) if cv_sq >= 0 else 0
+        ax.set_title(f"{category}: Item {item_id} (ADI={adi:.2f}, CV={cv_display:.2f})", loc="left", fontweight="bold", fontsize=10)
+        ax.set_xlabel("Date", fontsize=9)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        ax.tick_params(axis="x", rotation=30, labelsize=8)
+        ax.tick_params(axis="y", labelsize=8)
         if idx == 0:
-            ax.legend(loc='upper left', ncol=2, fontsize=7, framealpha=0.95)
-    
-    plt.suptitle('TSB-HB Probabilistic Fan Charts: Uncertainty Across Demand Patterns', 
-                fontsize=13, fontweight='bold', y=0.995)
+            ax.legend(loc="upper left", ncol=2, fontsize=7, framealpha=0.95)
+
+    plt.suptitle("Figure 2: Probabilistic Fan Charts across Intermittency Regimes", fontsize=13, fontweight="bold", y=0.995)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"[OK] Figure 3 (Fan Chart - 4 items) saved to {out_path}")
+    print(f"[OK] Figure 2 (Fan Chart) saved to {out_path}")
 
 
 def figure4_deepar_error_evolution(data_path: Path, out_path: Path):
@@ -551,30 +527,7 @@ def main():
     # Generate all figures
     figure1_pgm(fig_dir / "fig1_pgm.png")
     figure2_cold_start_shrinkage(data_path, fig_dir / "fig2_cold_start.png")
-    figure3_fan_chart_uai(data_path, fig_dir / "fig3_prediction_bands_new.png")
-    figure4_deepar_error_evolution(data_path, fig_dir / "fig4_deepar_error.png")
-    figure5_backtest_forecast(data_path, fig_dir / "fig5_backtest_forecast.png")
-    
-    print("\n[SUCCESS] All figures generated successfully!")
-    print(f"          Saved to: {fig_dir}")
-
-
-if __name__ == "__main__":
-    main()
-
-    # Paths
-    repo_root = Path(__file__).parent.parent.parent
-    data_path = repo_root / "data" / "online_retail.csv"
-    fig_dir = repo_root / "outputs" / "paper_figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
-    
-    print("Generating paper figures for TSB-HB...")
-    print(f"Output directory: {fig_dir}")
-    
-    # Generate all figures
-    figure1_pgm(fig_dir / "fig1_pgm.png")
-    figure2_cold_start_shrinkage(data_path, fig_dir / "fig2_cold_start.png")
-    figure3_fan_chart_uai(data_path, fig_dir / "fig3_prediction_bands_new.png")
+    figure3_fan_chart_uai(data_path, fig_dir / "fig2_fan_charts.png")
     figure4_deepar_error_evolution(data_path, fig_dir / "fig4_deepar_error.png")
     figure5_backtest_forecast(data_path, fig_dir / "fig5_backtest_forecast.png")
     

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,12 +18,25 @@ def rmse(y: np.ndarray, yhat: np.ndarray) -> float:
     return float(np.sqrt(np.nanmean((yhat - y) ** 2)))
 
 
+# -----------------------------
+# RMSSE / WRMSSE helpers
+# -----------------------------
+
 def _per_series_naive_mse(init_set: pd.DataFrame, y_col: str = "y") -> pd.Series:
+    """
+    Per-series naive MSE denominator for RMSSE.
+
+    IMPORTANT:
+    - If a series is constant in the init_set, naive MSE == 0, so RMSSE is undefined.
+    - We keep denom == 0 (do NOT epsilon-fix). We'll mark it as undefined later.
+    """
     init_sorted = init_set.sort_values(["unique_id", "ds"]).copy()
     init_sorted["y_lag1"] = init_sorted.groupby("unique_id")[y_col].shift(1)
     init_sorted["naive_sq_err"] = (init_sorted[y_col] - init_sorted["y_lag1"]) ** 2
-    epsilon = 1e-9
-    return init_sorted.groupby("unique_id")["naive_sq_err"].mean().where(lambda s: s > 0, epsilon)
+
+    denom = init_sorted.groupby("unique_id")["naive_sq_err"].mean()
+    # denom can be 0 (constant series) or NaN (too short); keep as-is
+    return denom
 
 
 def _per_series_model_mse(
@@ -41,18 +54,36 @@ def _prepare_rmsse_frame(
     eval_df: pd.DataFrame,
     y_col: str = "y",
     yhat_col: str = "y_pred",
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Returns:
+      - series_eval: index=unique_id, columns=[model_mse, rmsse_denom, scaled_err_sq]
+      - info: coverage info for undefined denom (scale=0)
+    """
     denom = _per_series_naive_mse(init_set, y_col=y_col)
     mse_per_series = _per_series_model_mse(eval_df, y_col=y_col, yhat_col=yhat_col)
-    series_eval = pd.concat([
-        mse_per_series.rename("model_mse"),
-        denom.rename("rmsse_denom"),
-    ], axis=1)
-    series_eval = series_eval.dropna(subset=["model_mse", "rmsse_denom"])
+
+    series_eval = pd.concat(
+        [mse_per_series.rename("model_mse"), denom.rename("rmsse_denom")],
+        axis=1,
+    ).dropna(subset=["model_mse", "rmsse_denom"])
+
     if series_eval.empty:
-        return series_eval
+        return series_eval, {"coverage": 0.0, "n_valid": 0.0, "n_total": 0.0, "n_undefined": 0.0}
+
+    # scale=0 (denom<=0) -> undefined RMSSE, exclude
+    is_defined = series_eval["rmsse_denom"] > 0
+    n_total = int(series_eval.shape[0])
+    n_valid = int(is_defined.sum())
+    n_undefined = int((~is_defined).sum())
+    coverage = float(n_valid / n_total) if n_total > 0 else 0.0
+
+    series_eval = series_eval.loc[is_defined].copy()
+    if series_eval.empty:
+        return series_eval, {"coverage": coverage, "n_valid": n_valid, "n_total": n_total, "n_undefined": n_undefined}
+
     series_eval["scaled_err_sq"] = series_eval["model_mse"] / series_eval["rmsse_denom"]
-    return series_eval
+    return series_eval, {"coverage": coverage, "n_valid": n_valid, "n_total": n_total, "n_undefined": n_undefined}
 
 
 def rmsse(
@@ -61,10 +92,10 @@ def rmsse(
     y_col: str = "y",
     yhat_col: str = "y_pred",
 ) -> float:
-    series_eval = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
+    series_eval, _ = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
     if series_eval.empty:
         return float("nan")
-    return float(np.sqrt(np.nanmean(series_eval["scaled_err_sq"])) )
+    return float(np.sqrt(np.nanmean(series_eval["scaled_err_sq"])))
 
 
 def wrmsse(
@@ -77,11 +108,51 @@ def wrmsse(
     """Weighted RMSSE using per-series demand weights.
 
     Weights default to the share of total demand in ``init_set``.
+    Undefined series (scale=0) are excluded (same as RMSSE).
     """
-
-    series_eval = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
+    series_eval, _ = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
     if series_eval.empty:
         return float("nan")
+
+    if weights is None:
+        weights = init_set.groupby("unique_id")[y_col].sum()
+    if not isinstance(weights, pd.Series):
+        weights = pd.Series(weights)
+
+    # Reindex to valid series only
+    weights = weights.reindex(series_eval.index).fillna(0.0)
+    total_weight = float(weights.sum())
+    if total_weight <= 0:
+        weights = pd.Series(1.0, index=series_eval.index)
+        total_weight = float(weights.sum())
+    norm_weights = weights / total_weight
+
+    weighted_scaled_err = series_eval["scaled_err_sq"] * norm_weights
+    return float(np.sqrt(np.nansum(weighted_scaled_err)))
+
+
+# NEW: report versions (give you coverage for paper appendix)
+def rmsse_report(
+    init_set: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    y_col: str = "y",
+    yhat_col: str = "y_pred",
+) -> Dict[str, float]:
+    series_eval, info = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
+    val = float("nan") if series_eval.empty else float(np.sqrt(np.nanmean(series_eval["scaled_err_sq"])))
+    return {"RMSSE": val, **info}
+
+
+def wrmsse_report(
+    init_set: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    weights: pd.Series | None = None,
+    y_col: str = "y",
+    yhat_col: str = "y_pred",
+) -> Dict[str, float]:
+    series_eval, info = _prepare_rmsse_frame(init_set, eval_df, y_col=y_col, yhat_col=yhat_col)
+    if series_eval.empty:
+        return {"WRMSSE": float("nan"), **info}
 
     if weights is None:
         weights = init_set.groupby("unique_id")[y_col].sum()
@@ -96,8 +167,13 @@ def wrmsse(
     norm_weights = weights / total_weight
 
     weighted_scaled_err = series_eval["scaled_err_sq"] * norm_weights
-    return float(np.sqrt(np.nansum(weighted_scaled_err)))
+    val = float(np.sqrt(np.nansum(weighted_scaled_err)))
+    return {"WRMSSE": val, **info}
 
+
+# -----------------------------
+# Probabilistic metrics (unchanged)
+# -----------------------------
 
 def coverage_rate(df: pd.DataFrame, lower_q: float, upper_q: float, alpha: float) -> Dict[str, float]:
     cover = ((df["y"] >= df[f"q_{lower_q}"]) & (df["y"] <= df[f"q_{upper_q}"])).mean()
@@ -154,4 +230,3 @@ def classify_adi_cv2(row: pd.Series, adi_threshold: float = 1.32, cv2_threshold:
         return "Erratic"
     else:
         return "Lumpy"
-
