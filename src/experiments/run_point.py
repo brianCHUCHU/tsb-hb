@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,7 @@ from models.tsb_hb import (
     predict_tsb_hb,
     update_online_tsb_hb,
 )
-from models.baselines import fit_predict_baselines
+from models.baselines import fit_predict_baselines, fit_predict_single_baseline, POINT_BASELINE_KEYS
 from models.hurdle_baselines import (
     fit_hurdle_global_lognormal,
     fit_hurdle_local_lognormal,
@@ -67,9 +68,6 @@ def _build_m5_hierarchy_group_labels(df: pd.DataFrame) -> pd.Series | None:
 
 
 def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
-    from statsforecast import StatsForecast
-    from statsforecast.models import CrostonClassic, CrostonSBA, TSB, ADIDA, IMAPA
-
     sales_df, calendar_df = load_m5_long(args.m5_sales, args.m5_calendar)
     df = preprocess_m5(sales_df, calendar_df, sample_size=args.m5_sample_size)
 
@@ -80,14 +78,22 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
     if eval_set.empty:
         raise ValueError("Evaluation set for M5 is empty; verify dataset contents and split parameters.")
 
+    eval_horizons = eval_set.groupby("unique_id").size()
+    eval_horizon = eval_set[["unique_id", "ds"]]
+    n_series = int(init_set["unique_id"].nunique())
+    timings: dict[str, float] = {}
+
     hierarchy_labels = _build_m5_hierarchy_group_labels(init_set)
     mode = args.m5_hierarchy_mode
     if mode in {"on", "ablation"} and hierarchy_labels is None:
         print("Warning: hierarchy labels unavailable in M5 frame; falling back to non-hierarchical TSB-HB.")
         mode = "off"
 
+    merged = eval_set[["unique_id", "ds", "y"]].copy()
     tsbhb_frames: list[pd.DataFrame] = []
+
     if mode in {"off", "ablation"}:
+        t0 = time.perf_counter()
         params_plain = fit_tsb_hb(
             init_set,
             group_labels=None,
@@ -95,8 +101,10 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
         )
         tsbhb_plain = predict_tsb_hb(params_plain, eval_set, quantiles=None)
         model_name = "TSB-HB" if mode == "off" else "TSB-HB-NoHierarchy"
+        timings[model_name] = time.perf_counter() - t0
         tsbhb_frames.append(tsbhb_plain.rename(columns={"yhat": model_name}))
     if mode in {"on", "ablation"} and hierarchy_labels is not None:
+        t0 = time.perf_counter()
         params_hier = fit_tsb_hb(
             init_set,
             group_labels=hierarchy_labels,
@@ -104,43 +112,43 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
         )
         tsbhb_hier = predict_tsb_hb(params_hier, eval_set, quantiles=None)
         model_name = "TSB-HB" if mode == "on" else "TSB-HB-Hierarchy"
+        timings[model_name] = time.perf_counter() - t0
         tsbhb_frames.append(tsbhb_hier.rename(columns={"yhat": model_name}))
 
+    for f in tsbhb_frames:
+        merged = merged.merge(f, on=["unique_id", "ds"], how="left")
+
+    for model_key in POINT_BASELINE_KEYS:
+        t0 = time.perf_counter()
+        pred = fit_predict_single_baseline(init_set, eval_horizons, model_key=model_key, freq="D")
+        timings[model_key] = time.perf_counter() - t0
+        if not pred.empty:
+            pred = pred.drop(columns=["index"], errors="ignore")
+            pred = pred.merge(eval_horizon, on=["unique_id", "ds"], how="inner")
+            merged = merged.merge(pred, on=["unique_id", "ds"], how="left")
+
+    t0 = time.perf_counter()
     local_params = fit_hurdle_local_lognormal(init_set)
     local_preds = predict_hurdle_local_lognormal(local_params, eval_set)[
         ["unique_id", "ds", "Hurdle-Local-LogNormal"]
     ]
+    timings["Hurdle-Local-LogNormal"] = time.perf_counter() - t0
+    merged = merged.merge(local_preds, on=["unique_id", "ds"], how="left")
+
+    t0 = time.perf_counter()
     global_params = fit_hurdle_global_lognormal(init_set)
     global_preds = predict_hurdle_global_lognormal(global_params, eval_set)[
         ["unique_id", "ds", "Hurdle-Global-LogNormal"]
     ]
-
-    sf = StatsForecast(
-        models=[
-            CrostonClassic(),
-            CrostonSBA(),
-            TSB(alpha_d=0.5, alpha_p=0.45),
-            ADIDA(),
-            IMAPA(),
-        ],
-        freq="D",
-        n_jobs=-1,
-    )
-    sf.fit(init_set[["unique_id", "ds", "y"]])
-    h_max = int(eval_set.groupby("unique_id").size().max())
-    fcst_df = sf.predict(h=h_max).reset_index()
-
-    eval_horizon = eval_set[["unique_id", "ds"]]
-    fcst_df = fcst_df.merge(eval_horizon, on=["unique_id", "ds"], how="inner")
-
-    merged = eval_set[["unique_id", "ds", "y"]].merge(fcst_df, on=["unique_id", "ds"], how="left")
-    for f in tsbhb_frames:
-        merged = merged.merge(f, on=["unique_id", "ds"], how="left")
-    merged = merged.merge(local_preds, on=["unique_id", "ds"], how="left")
+    timings["Hurdle-Global-LogNormal"] = time.perf_counter() - t0
     merged = merged.merge(global_preds, on=["unique_id", "ds"], how="left")
 
     model_cols = [c for c in merged.columns if c not in {"unique_id", "ds", "y", "index"}]
     metrics_df = evaluate_point_models(init_set, merged, model_cols=model_cols)
+    if n_series > 0:
+        metrics_df["Efficiency"] = metrics_df["model"].map(
+            lambda m: timings.get(m, 0.0) / n_series
+        )
     metrics_path = out_dir / "point_metrics_m5.csv"
     metrics_df.to_csv(metrics_path, index=False)
     if mode == "ablation":
@@ -221,6 +229,63 @@ def _run_online_point_fixed(
         hb_variance_prior_df=hb_variance_prior_df,
         baseline_mode=baseline_mode,
     )
+
+
+def _run_online_point_fixed_with_timing(
+    init_set: pd.DataFrame,
+    eval_set: pd.DataFrame,
+    hb_group_labels: pd.Series | None = None,
+    hb_group_shrink_strength: float = 0.0,
+    hb_item_variance_mode: str = "group",
+    hb_variance_prior_df: float = 20.0,
+    baseline_mode: str = "full",
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Run fixed-origin point forecasting and record per-model elapsed time (fit+predict) in seconds."""
+    timings: dict[str, float] = {}
+    merged = eval_set[["unique_id", "ds", "y"]].copy()
+
+    # TSB-HB
+    t0 = time.perf_counter()
+    params = fit_tsb_hb(
+        init_set,
+        group_labels=hb_group_labels,
+        group_shrink_strength=hb_group_shrink_strength,
+        item_variance_mode=hb_item_variance_mode,
+        item_variance_shrink_strength=hb_variance_prior_df,
+    )
+    tsbhb_point = predict_tsb_hb(params, eval_set, quantiles=None)
+    tsbhb_point = tsbhb_point.rename(columns={"yhat": "TSB-HB-LogNormal"})
+    timings["TSB-HB-LogNormal"] = time.perf_counter() - t0
+    merged = merged.merge(tsbhb_point, on=["unique_id", "ds"], how="left")
+
+    if baseline_mode == "full":
+        eval_horizons = eval_set["unique_id"].value_counts()
+        for model_key in POINT_BASELINE_KEYS:
+            t0 = time.perf_counter()
+            pred = fit_predict_single_baseline(
+                init_set, eval_horizons, model_key=model_key, freq="D"
+            )
+            timings[model_key] = time.perf_counter() - t0
+            if not pred.empty:
+                pred = pred.drop(columns=["index"], errors="ignore")
+                merged = merged.merge(pred, on=["unique_id", "ds"], how="left")
+
+    if baseline_mode in {"full", "hurdle_only"}:
+        t0 = time.perf_counter()
+        local_params = fit_hurdle_local_lognormal(init_set)
+        local_preds = predict_hurdle_local_lognormal(local_params, eval_set)
+        local_preds = local_preds[["unique_id", "ds", "Hurdle-Local-LogNormal"]]
+        timings["Hurdle-Local-LogNormal"] = time.perf_counter() - t0
+        merged = merged.merge(local_preds, on=["unique_id", "ds"], how="left")
+
+        t0 = time.perf_counter()
+        global_params = fit_hurdle_global_lognormal(init_set)
+        global_preds = predict_hurdle_global_lognormal(global_params, eval_set)
+        global_preds = global_preds[["unique_id", "ds", "Hurdle-Global-LogNormal"]]
+        timings["Hurdle-Global-LogNormal"] = time.perf_counter() - t0
+        merged = merged.merge(global_preds, on=["unique_id", "ds"], how="left")
+
+    return merged, timings
 
 
 def _run_online_point_walk_forward(
@@ -516,8 +581,9 @@ def main() -> None:
     baseline_mode = args.baseline_mode or "full"
     hb_variance_prior_df = float(max(args.hb_variance_prior_df, 2.1))
 
+    n_skus = int(init_set["unique_id"].nunique())
     if args.protocol == "fixed":
-        merged = _run_online_point_fixed(
+        merged, model_timings = _run_online_point_fixed_with_timing(
             init_set,
             eval_set,
             hb_group_labels=hb_group_labels,
@@ -527,6 +593,7 @@ def main() -> None:
             baseline_mode=baseline_mode,
         )
     else:
+        model_timings = {}
         merged = _run_online_point_walk_forward(
             init_set,
             eval_set,
@@ -544,6 +611,10 @@ def main() -> None:
     model_cols = [c for c in merged.columns if c not in {"unique_id", "ds", "y"}]
     point_df = evaluate_point_models(init_set, merged, model_cols=model_cols)
     point_df.insert(0, "protocol", args.protocol)
+    if model_timings and n_skus > 0:
+        point_df["Efficiency"] = point_df["model"].map(
+            lambda m: model_timings.get(m, 0.0) / n_skus
+        )
     point_df.to_csv(out_dir / "point_metrics.csv", index=False)
 
     _write_shrinkage_plots(

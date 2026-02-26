@@ -136,3 +136,44 @@ def fit_predict_baselines(
         probabilistic=probabilistic,
         levels=levels,
     )
+
+
+# Single-model keys for timing (point forecasting default set)
+POINT_BASELINE_KEYS = [
+    "CrostonClassic",
+    "CrostonSBA",
+    "TSB",
+    "ADIDA",
+    "IMAPA",
+    "AutoTheta",
+    "AutoARIMA",
+]
+
+
+def fit_predict_single_baseline(
+    train_df: pd.DataFrame,
+    horizons: pd.Series,
+    model_key: str,
+    freq: str = "D",
+) -> pd.DataFrame:
+    """Fit and predict a single StatsForecast model. Used for per-model timing."""
+    _, M = _import_statsforecast()
+    if model_key not in M:
+        return pd.DataFrame()
+    horizon_df = _prepare_horizons(horizons)
+    if model_key == "TSB":
+        model = M["TSB"](alpha_d=0.5, alpha_p=0.45)
+    elif model_key == "AutoARIMA":
+        model = M["AutoARIMA"]()
+    elif model_key == "AutoTheta":
+        model = M["AutoTheta"]()
+    else:
+        model = M[model_key]()
+    return _fit_predict_panel(
+        train_df=train_df,
+        horizon_df=horizon_df,
+        models=[model],
+        freq=freq,
+        probabilistic=False,
+        levels=None,
+    )

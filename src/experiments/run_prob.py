@@ -8,8 +8,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from utils import set_seed, default_data_file, default_out_dir
-from data_loading import load_online_retail, preprocess_online_retail, train_eval_split_fixed_origin
+from utils import (
+    set_seed,
+    default_data_file,
+    default_out_dir,
+    default_m5_sales_file,
+    default_m5_calendar_file,
+)
+from data_loading import (
+    load_online_retail,
+    preprocess_online_retail,
+    train_eval_split_fixed_origin,
+    load_m5_long,
+    preprocess_m5,
+)
 from experiments.protocols import evaluate_prob_models, iter_walk_forward_frames
 from models.tsb_hb import (
     fit_tsb_hb,
@@ -476,7 +488,19 @@ def _predict_deepar_fixed(
     return out[["model", "unique_id", "ds"] + qcols]
 
 
-def plot_calibration_curve(eval_merged: pd.DataFrame, quantiles: list[float], out_dir: Path) -> None:
+def plot_calibration_curve(
+    eval_merged: pd.DataFrame,
+    quantiles: list[float],
+    out_dir: Path,
+    models_to_plot: list[str] | None = None,
+) -> None:
+    if models_to_plot is not None:
+        eval_merged = eval_merged[eval_merged["model"].isin(models_to_plot)]
+        if eval_merged.empty:
+            plt.figure(figsize=(8, 8))
+            plt.savefig(out_dir / "calibration_curve.png", dpi=300, bbox_inches="tight")
+            plt.close()
+            return
     plt.figure(figsize=(8, 8))
     plt.plot([0, 1], [0, 1], "k--", label="Perfect Calibration")
 
@@ -494,8 +518,8 @@ def plot_calibration_curve(eval_merged: pd.DataFrame, quantiles: list[float], ou
     plt.xlabel("Nominal Coverage (Quantile)")
     plt.ylabel("Empirical Coverage")
     plt.title("Calibration Curve (Reliability Diagram)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.6, linewidth=0.8, color="gray")
     plt.savefig(out_dir / "calibration_curve.png", dpi=300, bbox_inches="tight")
     plt.close()
 
@@ -717,6 +741,30 @@ def _pit_long(eval_merged: pd.DataFrame, quantiles: list[float]) -> pd.DataFrame
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=default_data_file())
+    ap.add_argument(
+        "--dataset",
+        choices=["online", "m5"],
+        default="online",
+        help="Dataset for probabilistic experiment: 'online' (Online Retail) or 'm5' (M5 competition).",
+    )
+    ap.add_argument(
+        "--m5-sales",
+        type=Path,
+        default=default_m5_sales_file(),
+        help="Path to M5 sales file (wide or long). Used when --dataset m5.",
+    )
+    ap.add_argument(
+        "--m5-calendar",
+        type=Path,
+        default=default_m5_calendar_file(),
+        help="Path to M5 calendar.csv. Used when --dataset m5.",
+    )
+    ap.add_argument(
+        "--m5-sample-size",
+        type=int,
+        default=5000,
+        help="Number of M5 series to subsample for experiments (None = use all). Used when --dataset m5.",
+    )
     ap.add_argument("--out", type=Path, default=default_out_dir())
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--min-len", type=int, default=30)
@@ -762,8 +810,12 @@ def run(args: argparse.Namespace) -> None:
     out_dir: Path = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df_raw = load_online_retail(args.data)
-    df = preprocess_online_retail(df_raw)
+    if args.dataset == "online":
+        df_raw = load_online_retail(args.data)
+        df = preprocess_online_retail(df_raw)
+    else:
+        sales_df, calendar_df = load_m5_long(args.m5_sales, args.m5_calendar)
+        df = preprocess_m5(sales_df, calendar_df, sample_size=args.m5_sample_size)
     init_set, eval_set = train_eval_split_fixed_origin(df, init_ratio=args.init_ratio, min_len=args.min_len)
     if eval_set.empty:
         raise ValueError("Evaluation set is empty; verify split parameters and input data.")
