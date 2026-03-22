@@ -2,8 +2,6 @@
 
 Reference implementation for `Taxonomy-Conditioned Hierarchical Bayesian TSB Models for Heterogeneous Intermittent Demand Forecasting`.
 
-This repository is paper-facing. The canonical configuration follows `Hummer_noHurdle.tex`:
-
 - Online Retail uses ADI/CV^2 taxonomy-conditioned pooling computed once from the initialization window.
 - M5 uses a single global pool in the main reported run.
 - Fixed-origin is the main evaluation protocol; walk-forward is kept as a robustness check.
