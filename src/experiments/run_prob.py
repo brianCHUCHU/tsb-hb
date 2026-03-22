@@ -50,6 +50,29 @@ except (ImportError, AttributeError):
 
 
 QUANTILES = [0.10, 0.25, 0.50, 0.75, 0.90]
+PROB_TSBHB_MODEL = "TSB-HB"
+
+
+def _normalize_prob_baseline_mode(baseline_mode: str | None) -> str:
+    mode = str(baseline_mode or "paper").lower()
+    if mode == "full":
+        mode = "extended"
+    valid = {"paper", "extended", "hurdle_only", "hb_only"}
+    if mode not in valid:
+        raise ValueError("baseline_mode must be one of: paper, extended, full, hurdle_only, hb_only.")
+    return mode
+
+
+def _include_parametric_prob_baselines(baseline_mode: str) -> bool:
+    return baseline_mode in {"paper", "extended"}
+
+
+def _include_hurdle_prob_baselines(baseline_mode: str) -> bool:
+    return baseline_mode in {"extended", "hurdle_only"}
+
+
+def _include_conformal_prob_baselines(baseline_mode: str) -> bool:
+    return baseline_mode in {"paper", "extended"}
 
 
 def _qcols(quantiles: list[float]) -> list[str]:
@@ -290,43 +313,46 @@ def _predict_non_hb_prob_models_once(
     train_df: pd.DataFrame,
     eval_df: pd.DataFrame,
     quantiles: list[float],
-    baseline_mode: str = "full",
+    baseline_mode: str = "paper",
 ) -> pd.DataFrame:
     qcols = _qcols(quantiles)
     if eval_df.empty:
         return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
-    if baseline_mode not in {"full", "hurdle_only", "hb_only"}:
-        raise ValueError("baseline_mode must be one of: full, hurdle_only, hb_only.")
+    baseline_mode = _normalize_prob_baseline_mode(baseline_mode)
     if baseline_mode == "hb_only":
         return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
 
     frames: list[pd.DataFrame] = []
-    if baseline_mode == "full":
+    if _include_parametric_prob_baselines(baseline_mode):
         eval_h = eval_df["unique_id"].value_counts()
         sf_q = fit_predict_baselines(train_df, eval_h, freq="D", probabilistic=True, levels=[80, 50])
         arima = _extract_sf_quantiles(sf_q, "AutoARIMA", quantiles)
         theta = _extract_sf_quantiles(sf_q, "AutoTheta", quantiles)
         frames.extend([arima, theta])
 
-    local_params = fit_hurdle_local_lognormal(train_df)
-    local_q = predict_hurdle_local_lognormal(local_params, eval_df, quantiles=quantiles)
-    for c in qcols:
-        if c not in local_q.columns:
-            local_q[c] = np.nan
-    local_q = _enforce_monotonic_quantiles(local_q, quantiles=quantiles)
-    local_q["model"] = "Hurdle-Local-LogNormal"
-    local_q = local_q[["model", "unique_id", "ds"] + qcols]
+    if _include_hurdle_prob_baselines(baseline_mode):
+        local_params = fit_hurdle_local_lognormal(train_df)
+        local_q = predict_hurdle_local_lognormal(local_params, eval_df, quantiles=quantiles)
+        for c in qcols:
+            if c not in local_q.columns:
+                local_q[c] = np.nan
+        local_q = _enforce_monotonic_quantiles(local_q, quantiles=quantiles)
+        local_q["model"] = "Hurdle-Local-LogNormal"
+        local_q = local_q[["model", "unique_id", "ds"] + qcols]
 
-    global_params = fit_hurdle_global_lognormal(train_df)
-    global_q = predict_hurdle_global_lognormal(global_params, eval_df, quantiles=quantiles)
-    for c in qcols:
-        if c not in global_q.columns:
-            global_q[c] = np.nan
-    global_q = _enforce_monotonic_quantiles(global_q, quantiles=quantiles)
-    global_q["model"] = "Hurdle-Global-LogNormal"
-    global_q = global_q[["model", "unique_id", "ds"] + qcols]
+        global_params = fit_hurdle_global_lognormal(train_df)
+        global_q = predict_hurdle_global_lognormal(global_params, eval_df, quantiles=quantiles)
+        for c in qcols:
+            if c not in global_q.columns:
+                global_q[c] = np.nan
+        global_q = _enforce_monotonic_quantiles(global_q, quantiles=quantiles)
+        global_q["model"] = "Hurdle-Global-LogNormal"
+        global_q = global_q[["model", "unique_id", "ds"] + qcols]
 
-    frames.extend([local_q, global_q])
+        frames.extend([local_q, global_q])
+
+    if not frames:
+        return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
     return pd.concat(frames, ignore_index=True)
 
 
@@ -342,7 +368,7 @@ def _predict_prob_models_once(
     hb_item_variance_mode: str = "group",
     hb_variance_prior_df: float = 20.0,
     hb_calibration: Optional[dict[str, float | str]] = None,
-    baseline_mode: str = "full",
+    baseline_mode: str = "paper",
     include_conformal: bool = False,
     conformal_cal_ratio: float = 0.2,
 ) -> pd.DataFrame:
@@ -370,7 +396,7 @@ def _predict_prob_models_once(
         if c not in tsbhb_q.columns:
             tsbhb_q[c] = np.nan
     tsbhb_q = _apply_hb_calibration(tsbhb_q, quantiles=quantiles, calibration=hb_calibration)
-    tsbhb_q["model"] = "TSB-HB"
+    tsbhb_q["model"] = PROB_TSBHB_MODEL
     tsbhb_q = tsbhb_q[["model", "unique_id", "ds"] + qcols]
 
     non_hb = _predict_non_hb_prob_models_once(
@@ -382,7 +408,8 @@ def _predict_prob_models_once(
 
     all_frames = [tsbhb_q, non_hb]
 
-    if include_conformal and baseline_mode in {"full", "hurdle_only"}:
+    baseline_mode = _normalize_prob_baseline_mode(baseline_mode)
+    if include_conformal and _include_conformal_prob_baselines(baseline_mode):
         conformal_q = fit_predict_conformal_baselines(
             train_df, eval_df,
             quantiles=quantiles,
@@ -771,7 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--init-ratio", type=float, default=1.0 / 3.0)
     ap.add_argument("--protocol", choices=["fixed", "walk_forward"], default="fixed")
     ap.add_argument("--walk-step", type=int, default=1, help="Block size (steps) for walk-forward protocol.")
-    ap.add_argument("--baseline-mode", choices=["full", "hurdle_only", "hb_only"], default=None, help="Baseline set for both fixed and walk-forward: full=AutoARIMA/AutoTheta+hurdle, hurdle_only=hurdle+TSB-HB, hb_only=TSB-HB only.")
+    ap.add_argument("--baseline-mode", choices=["paper", "extended", "full", "hurdle_only", "hb_only"], default=None, help="Baseline set for both fixed and walk-forward: paper=TSB-HB + AutoARIMA/AutoTheta + conformal wrappers for point baselines, extended=paper + hurdle baselines, full=legacy alias for extended, hurdle_only=TSB-HB + hurdle baselines, hb_only=TSB-HB only.")
     ap.add_argument("--hb-regime-aware", dest="hb_regime_aware", action="store_true", default=True, help="Use ADI/CV^2 regime-aware HB priors.")
     ap.add_argument("--no-hb-regime-aware", dest="hb_regime_aware", action="store_false", help="Disable regime-aware priors and use global HB priors.")
     ap.add_argument("--hb-group-shrink-strength", type=float, default=0.0, help="Extra shrink from group-level hyperparameters back to global hyperparameters (0 disables).")
@@ -784,7 +811,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--hb-variance-prior-df", type=float, default=20.0, help="Prior degrees of freedom for conjugate variance model (larger = stronger shrinkage).")
     ap.add_argument("--hb-bootstrap-draws", type=int, default=20, help="Bootstrap draws for TSB-HB hyperparameter uncertainty (fixed protocol).")
     ap.add_argument("--hb-disable-hyper-uncertainty", action="store_true", help="Disable bootstrap hyperparameter uncertainty even when draws > 0.")
-    ap.add_argument("--hb-calibration-mode", choices=["none", "location_scale"], default="none", help="Optional post-hoc calibration for TSB-HB quantiles.")
+    ap.add_argument("--hb-calibration-mode", choices=["none", "location_scale"], default="location_scale", help="Optional post-hoc calibration for TSB-HB quantiles. The paper release uses location_scale.")
     ap.add_argument("--hb-calibration-ratio", type=float, default=0.20, help="Tail fraction of init_set reserved to fit calibration shifts.")
     ap.add_argument("--hb-calibration-samples", type=int, default=1000, help="Monte Carlo samples when fitting calibration shifts.")
     ap.add_argument("--hb-calibration-lambda-min", type=float, default=0.60, help="Lower bound for location-scale calibration lambda.")
@@ -823,7 +850,7 @@ def run(args: argparse.Namespace) -> None:
     qcols = _qcols(QUANTILES)
     hb_group_labels = _build_regime_group_labels(init_set) if args.hb_regime_aware else None
     hb_use_hyper_uncertainty = (not args.hb_disable_hyper_uncertainty) and (args.hb_bootstrap_draws > 0)
-    baseline_mode = args.baseline_mode or "full"
+    baseline_mode = _normalize_prob_baseline_mode(args.baseline_mode)
     hb_variance_prior_df = float(max(args.hb_variance_prior_df, 2.1))
     hb_calibration: Optional[dict[str, float | str]] = None
     if args.hb_calibration_mode == "location_scale":
@@ -848,7 +875,7 @@ def run(args: argparse.Namespace) -> None:
         pd.DataFrame(
             [
                 {
-                    "model": "TSB-HB",
+                    "model": PROB_TSBHB_MODEL,
                     "calibration_mode": str(hb_calibration.get("mode", args.hb_calibration_mode)),
                     **hb_calibration,
                 }
@@ -915,7 +942,7 @@ def run(args: argparse.Namespace) -> None:
                     quantiles=QUANTILES,
                     calibration=hb_calibration,
                 )
-                tsbhb_q["model"] = "TSB-HB"
+                tsbhb_q["model"] = PROB_TSBHB_MODEL
                 tsbhb_q = tsbhb_q[["model", "unique_id", "ds"] + qcols]
 
                 non_hb_q = _predict_non_hb_prob_models_once(
@@ -925,7 +952,7 @@ def run(args: argparse.Namespace) -> None:
                     baseline_mode=baseline_mode,
                 )
                 step_frames = [tsbhb_q, non_hb_q]
-                if args.include_conformal and baseline_mode in {"full", "hurdle_only"}:
+                if args.include_conformal and _include_conformal_prob_baselines(baseline_mode):
                     cp_q = fit_predict_conformal_baselines(
                         frame.history, frame.target,
                         quantiles=QUANTILES,

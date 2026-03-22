@@ -42,7 +42,7 @@ def main() -> None:
     size_mle_ln = np.exp(item_stats_for_mle["mean_log"] + (item_stats_for_mle["var_log"] / 2.0))
     forecast_mle = (p_mle * size_mle_ln).fillna(0)
 
-    # TSB-HB-LogNormal (our main)
+    # TSB-HB (our main)
     params = fit_tsb_hb(init_set)
     size_post_mean = np.exp(params.shrunk_mean_log + params.sigma_sq_process / 2.0)
     forecast_hb_logn = (params.p_posterior * size_post_mean).fillna(0)
@@ -64,14 +64,14 @@ def main() -> None:
 
     # Merge for evaluation
     eva = eval_set[["unique_id", "ds", "y"]].copy()
-    eva = eva.merge(forecast_hb_logn.rename("TSB-HB-LogNormal"), on="unique_id", how="left")
+    eva = eva.merge(forecast_hb_logn.rename("TSB-HB"), on="unique_id", how="left")
     eva = eva.merge(forecast_mle.rename("TSB-MLE-LogNormal"), on="unique_id", how="left")
     eva = eva.merge(forecast_hb_gamma.rename("TSB-HB-Gamma"), on="unique_id", how="left")
-    for c in ["TSB-HB-LogNormal", "TSB-MLE-LogNormal", "TSB-HB-Gamma"]:
+    for c in ["TSB-HB", "TSB-MLE-LogNormal", "TSB-HB-Gamma"]:
         eva[c] = eva[c].fillna(0)
 
     results = []
-    for c in ["TSB-HB-LogNormal", "TSB-MLE-LogNormal", "TSB-HB-Gamma"]:
+    for c in ["TSB-HB", "TSB-MLE-LogNormal", "TSB-HB-Gamma"]:
         tmp = eva[["unique_id", "y", c]].rename(columns={c: "y_pred"}).copy()
         results.append({
             "model": c,
@@ -87,4 +87,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

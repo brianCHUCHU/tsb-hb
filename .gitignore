@@ -218,6 +218,10 @@ __pycache__/
 *.egg-info/
 .venv/
 .venv*/
+
+# Generated experiment artifacts
+outputs/
+final_experiment_result/
 .env
 .env*/
 .ipynb_checkpoints/
