@@ -38,6 +38,7 @@ from models.hurdle_baselines import (
     predict_hurdle_global_lognormal,
     predict_hurdle_local_lognormal,
 )
+from models.tweedie_baseline import TWEEDIE_POINT_COL, fit_predict_tweedie_panel
 from metrics import rmsse, wrmsse, compute_adi_cv2, classify_adi_cv2
 from plotting import plot_shrinkage_scatter
 
@@ -88,6 +89,11 @@ def _build_m5_hierarchy_group_labels(df: pd.DataFrame) -> pd.Series | None:
     return None
 
 
+def _build_m5_taxonomy4_group_labels(df: pd.DataFrame) -> pd.Series | None:
+    """Build 4-group taxonomy labels on M5 via ADI/CV^2 (Smooth/Erratic/Intermittent/Lumpy)."""
+    return _build_regime_group_labels(df)
+
+
 def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
     sales_df, calendar_df = load_m5_long(args.m5_sales, args.m5_calendar)
     df = preprocess_m5(sales_df, calendar_df, sample_size=args.m5_sample_size)
@@ -106,9 +112,13 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
     baseline_mode = _normalize_point_baseline_mode(args.baseline_mode)
 
     hierarchy_labels = _build_m5_hierarchy_group_labels(init_set)
+    taxonomy4_labels = _build_m5_taxonomy4_group_labels(init_set)
     mode = args.m5_hierarchy_mode
     if mode in {"on", "ablation"} and hierarchy_labels is None:
         print("Warning: hierarchy labels unavailable in M5 frame; falling back to non-hierarchical TSB-HB.")
+        mode = "off"
+    if mode in {"taxonomy4"} and taxonomy4_labels is None:
+        print("Warning: taxonomy4 labels unavailable in M5 frame; falling back to non-hierarchical TSB-HB.")
         mode = "off"
 
     merged = eval_set[["unique_id", "ds", "y"]].copy()
@@ -140,6 +150,19 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
         model_name = POINT_TSBHB_MODEL if mode == "on" else "TSB-HB-Hierarchy"
         timings[model_name] = time.perf_counter() - t0
         tsbhb_frames.append(tsbhb_hier.rename(columns={"yhat": model_name}))
+    if mode in {"taxonomy4"} and taxonomy4_labels is not None:
+        t0 = time.perf_counter()
+        params_tax4 = fit_tsb_hb(
+            init_set,
+            group_labels=taxonomy4_labels,
+            group_shrink_strength=args.hb_group_shrink_strength,
+            item_variance_mode=args.hb_item_variance_mode,
+            item_variance_shrink_strength=args.hb_variance_prior_df,
+        )
+        tsbhb_tax4 = predict_tsb_hb(params_tax4, eval_set, quantiles=None)
+        model_name = "TSB-HB-Taxonomy4"
+        timings[model_name] = time.perf_counter() - t0
+        tsbhb_frames.append(tsbhb_tax4.rename(columns={"yhat": model_name}))
 
     for f in tsbhb_frames:
         merged = merged.merge(f, on=["unique_id", "ds"], how="left")
@@ -171,6 +194,21 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
         timings["Hurdle-Global-LogNormal"] = time.perf_counter() - t0
         merged = merged.merge(global_preds, on=["unique_id", "ds"], how="left")
 
+    if getattr(args, "with_iets", False):
+        from models.iets_baseline import IETS_POINT_COL, fit_predict_iets_panel
+
+        t0 = time.perf_counter()
+        iets_pred = fit_predict_iets_panel(
+            init_set,
+            eval_set,
+            rscript=str(args.iets_rscript),
+            script_path=args.iets_script,
+            seed=int(args.seed),
+            occurrence=str(args.iets_occurrence),
+        )
+        timings[IETS_POINT_COL] = time.perf_counter() - t0
+        merged = merged.merge(iets_pred, on=["unique_id", "ds"], how="left")
+
     model_cols = [c for c in merged.columns if c not in {"unique_id", "ds", "y", "index"}]
     metrics_df = evaluate_point_models(init_set, merged, model_cols=model_cols)
     if n_series > 0:
@@ -197,6 +235,11 @@ def _predict_online_models_once(
     hb_variance_prior_df: float = 20.0,
     tsbhb_override: pd.DataFrame | None = None,
     baseline_mode: str = "paper",
+    with_tweedie: bool = False,
+    tweedie_lags: int = 14,
+    tweedie_power: float = 1.5,
+    tweedie_alpha: float = 0.1,
+    tweedie_max_iter: int = 1000,
 ) -> pd.DataFrame:
     baseline_mode = _normalize_point_baseline_mode(baseline_mode)
 
@@ -235,6 +278,16 @@ def _predict_online_models_once(
 
         merged = merged.merge(local_preds, on=["unique_id", "ds"], how="left")
         merged = merged.merge(global_preds, on=["unique_id", "ds"], how="left")
+    if with_tweedie:
+        tw_pred = fit_predict_tweedie_panel(
+            train_df,
+            eval_df,
+            lags=tweedie_lags,
+            power=tweedie_power,
+            alpha=tweedie_alpha,
+            max_iter=tweedie_max_iter,
+        )
+        merged = merged.merge(tw_pred, on=["unique_id", "ds"], how="left")
     return merged
 
 
@@ -266,6 +319,17 @@ def _run_online_point_fixed_with_timing(
     hb_item_variance_mode: str = "group",
     hb_variance_prior_df: float = 20.0,
     baseline_mode: str = "paper",
+    *,
+    seed: int = 42,
+    with_iets: bool = False,
+    iets_rscript: str = "Rscript",
+    iets_script: Path | None = None,
+    iets_occurrence: str = "auto",
+    with_tweedie: bool = False,
+    tweedie_lags: int = 14,
+    tweedie_power: float = 1.5,
+    tweedie_alpha: float = 0.1,
+    tweedie_max_iter: int = 1000,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Run fixed-origin point forecasting and record per-model elapsed time (fit+predict) in seconds."""
     timings: dict[str, float] = {}
@@ -314,6 +378,33 @@ def _run_online_point_fixed_with_timing(
         timings["Hurdle-Global-LogNormal"] = time.perf_counter() - t0
         merged = merged.merge(global_preds, on=["unique_id", "ds"], how="left")
 
+    if with_iets:
+        from models.iets_baseline import IETS_POINT_COL, fit_predict_iets_panel
+
+        t0 = time.perf_counter()
+        iets_pred = fit_predict_iets_panel(
+            init_set,
+            eval_set,
+            rscript=iets_rscript,
+            script_path=iets_script,
+            seed=seed,
+            occurrence=iets_occurrence,
+        )
+        timings[IETS_POINT_COL] = time.perf_counter() - t0
+        merged = merged.merge(iets_pred, on=["unique_id", "ds"], how="left")
+    if with_tweedie:
+        t0 = time.perf_counter()
+        tw_pred = fit_predict_tweedie_panel(
+            init_set,
+            eval_set,
+            lags=tweedie_lags,
+            power=tweedie_power,
+            alpha=tweedie_alpha,
+            max_iter=tweedie_max_iter,
+        )
+        timings[TWEEDIE_POINT_COL] = time.perf_counter() - t0
+        merged = merged.merge(tw_pred, on=["unique_id", "ds"], how="left")
+
     return merged, timings
 
 
@@ -329,9 +420,26 @@ def _run_online_point_walk_forward(
     hb_item_variance_mode: str = "group",
     hb_variance_prior_df: float = 20.0,
     baseline_mode: str = "paper",
+    with_iets: bool = False,
+    iets_rscript: str = "Rscript",
+    iets_script: Path | None = None,
+    iets_occurrence: str = "auto",
+    seed: int = 42,
+    with_tweedie: bool = False,
+    tweedie_lags: int = 14,
+    tweedie_power: float = 1.5,
+    tweedie_alpha: float = 0.1,
+    tweedie_max_iter: int = 1000,
 ) -> pd.DataFrame:
     step_outputs: list[pd.DataFrame] = []
+    total_frames = max(int(np.ceil(eval_set.groupby("unique_id").size().max() / walk_step)), 1)
     hb_state: TSBHBOnlineState | None = None
+    fit_predict_iets_panel = None
+    iets_col: str | None = None
+    if with_iets:
+        from models.iets_baseline import IETS_POINT_COL, fit_predict_iets_panel as _fit_predict_iets_panel
+        fit_predict_iets_panel = _fit_predict_iets_panel
+        iets_col = IETS_POINT_COL
     if hb_online_update:
         hb_state = initialize_online_tsb_hb(
             init_set,
@@ -343,7 +451,12 @@ def _run_online_point_walk_forward(
             item_variance_shrink_strength=hb_variance_prior_df,
         )
 
-    for frame in iter_walk_forward_frames(init_set, eval_set, step_size=walk_step):
+    for frame_idx, frame in enumerate(iter_walk_forward_frames(init_set, eval_set, step_size=walk_step), start=1):
+        if frame_idx == 1 or frame_idx % 10 == 0 or frame_idx == total_frames:
+            print(
+                f"[walk_forward] frame {frame_idx}/{total_frames} "
+                f"(step={frame.step}, n_target={len(frame.target)})"
+            )
         if hb_state is not None:
             tsbhb_step = predict_online_tsb_hb(
                 hb_state,
@@ -360,6 +473,11 @@ def _run_online_point_walk_forward(
                 hb_variance_prior_df=hb_variance_prior_df,
                 tsbhb_override=tsbhb_step,
                 baseline_mode=baseline_mode,
+                with_tweedie=with_tweedie,
+                tweedie_lags=tweedie_lags,
+                tweedie_power=tweedie_power,
+                tweedie_alpha=tweedie_alpha,
+                tweedie_max_iter=tweedie_max_iter,
             )
             hb_state = update_online_tsb_hb(hb_state, frame.target)
         else:
@@ -371,6 +489,30 @@ def _run_online_point_walk_forward(
                 hb_item_variance_mode=hb_item_variance_mode,
                 hb_variance_prior_df=hb_variance_prior_df,
                 baseline_mode=baseline_mode,
+                with_tweedie=with_tweedie,
+                tweedie_lags=tweedie_lags,
+                tweedie_power=tweedie_power,
+                tweedie_alpha=tweedie_alpha,
+                tweedie_max_iter=tweedie_max_iter,
+            )
+        if with_iets and fit_predict_iets_panel is not None and iets_col is not None:
+            iets_step = fit_predict_iets_panel(
+                frame.history,
+                frame.target,
+                rscript=iets_rscript,
+                script_path=iets_script,
+                seed=seed,
+                occurrence=iets_occurrence,
+            )
+            # R output can cast ids/dates to different dtypes; align keys before merging.
+            merged_step["unique_id"] = merged_step["unique_id"].astype(str)
+            merged_step["ds"] = pd.to_datetime(merged_step["ds"])
+            iets_step["unique_id"] = iets_step["unique_id"].astype(str)
+            iets_step["ds"] = pd.to_datetime(iets_step["ds"])
+            merged_step = merged_step.merge(
+                iets_step[["unique_id", "ds", iets_col]],
+                on=["unique_id", "ds"],
+                how="left",
             )
         step_outputs.append(merged_step)
 
@@ -569,7 +711,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=["online_retail", "m5"], default="online_retail")
     ap.add_argument("--protocol", choices=["fixed", "walk_forward"], default="fixed")
-    ap.add_argument("--walk-step", type=int, default=1, help="Block size (steps) for walk-forward protocol.")
+    ap.add_argument("--walk-step", type=int, default=7, help="Block size (steps) for walk-forward protocol. Larger values are faster and reduce repeated re-fitting cost.")
     ap.add_argument("--baseline-mode", choices=["paper", "extended", "full", "hurdle_only", "hb_only"], default=None, help="Baseline set for both fixed and walk-forward: paper=TSB-HB + classical baselines from the paper, extended=paper + hurdle baselines, full=legacy alias for extended, hurdle_only=TSB-HB + hurdle baselines, hb_only=TSB-HB only.")
     ap.add_argument("--hb-regime-aware", dest="hb_regime_aware", action="store_true", default=True, help="Use ADI/CV^2 regime-aware HB priors for Online Retail.")
     ap.add_argument("--no-hb-regime-aware", dest="hb_regime_aware", action="store_false", help="Disable regime-aware priors and use global HB priors.")
@@ -581,13 +723,42 @@ def main() -> None:
     ap.add_argument("--hb-occ-discount", type=float, default=1.0, help="Discount factor for dynamic occurrence update (0<d<=1). Smaller means faster adaptation.")
     ap.add_argument("--hb-item-variance-mode", choices=["group", "conjugate"], default="conjugate", help="Process variance mode for size: group or conjugate.")
     ap.add_argument("--hb-variance-prior-df", type=float, default=20.0, help="Prior degrees of freedom for conjugate variance model (larger = stronger shrinkage).")
-    ap.add_argument("--m5-hierarchy-mode", choices=["off", "on", "ablation"], default="off", help="M5 hierarchy usage for TSB-HB: off=single global pool (paper default), on=hier priors, ablation=report both.")
+    ap.add_argument("--m5-hierarchy-mode", choices=["off", "on", "ablation", "taxonomy4"], default="off", help="M5 grouping for TSB-HB: off=single global pool (paper default), on=hier priors, ablation=off vs hierarchy, taxonomy4=ADI/CV^2 4-group pooling.")
     ap.add_argument("--data", type=Path, default=default_data_file())
     ap.add_argument("--m5-sales", type=Path, default=default_m5_sales_file())
     ap.add_argument("--m5-calendar", type=Path, default=default_m5_calendar_file())
     ap.add_argument("--m5-sample-size", type=int, default=5000)
+    ap.add_argument(
+        "--max-series",
+        type=int,
+        default=None,
+        help="Optional cap on number of Online Retail series (after preprocess) for faster runs; omit for all series.",
+    )
     ap.add_argument("--out", type=Path, default=default_out_dir())
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--with-iets",
+        action="store_true",
+        help="Include iETS point forecasts via R smooth::adam (requires R on PATH and CRAN packages smooth, greybox). Supported for fixed and walk_forward on online retail, and fixed runs on M5.",
+    )
+    ap.add_argument("--with-tweedie", action="store_true", help="Include Tweedie autoregressive baseline.")
+    ap.add_argument("--tweedie-lags", type=int, default=14, help="Number of lag features for Tweedie baseline.")
+    ap.add_argument("--tweedie-power", type=float, default=1.5, help="Tweedie variance power (1<p<2 typical for intermittent demand).")
+    ap.add_argument("--tweedie-alpha", type=float, default=0.1, help="L2 regularization strength for Tweedie baseline.")
+    ap.add_argument("--tweedie-max-iter", type=int, default=1000, help="Max optimizer iterations for Tweedie baseline.")
+    ap.add_argument("--iets-rscript", type=str, default="Rscript", help="Rscript executable for iETS.")
+    ap.add_argument(
+        "--iets-script",
+        type=Path,
+        default=None,
+        help="Path to iets_panel_forecast.R (default: <repo>/scripts/iets_panel_forecast.R).",
+    )
+    ap.add_argument(
+        "--iets-occurrence",
+        type=str,
+        default="auto",
+        help="adam() occurrence= argument (e.g. auto, direct, fixed, odds-ratio).",
+    )
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -603,6 +774,12 @@ def main() -> None:
     # Load & preprocess
     df_raw = load_online_retail(args.data)
     df = preprocess_online_retail(df_raw)
+    if args.max_series is not None:
+        max_series = max(int(args.max_series), 1)
+        uids = df["unique_id"].drop_duplicates()
+        if len(uids) > max_series:
+            keep = np.random.choice(uids.to_numpy(), size=max_series, replace=False)
+            df = df[df["unique_id"].isin(keep)].copy()
 
     # Split fixed origin
     init_set, eval_set = train_eval_split_fixed_origin(df, init_ratio=1 / 3, min_len=30)
@@ -620,6 +797,16 @@ def main() -> None:
             hb_item_variance_mode=args.hb_item_variance_mode,
             hb_variance_prior_df=hb_variance_prior_df,
             baseline_mode=baseline_mode,
+            seed=int(args.seed),
+            with_iets=bool(args.with_iets),
+            iets_rscript=str(args.iets_rscript),
+            iets_script=args.iets_script,
+            iets_occurrence=str(args.iets_occurrence),
+            with_tweedie=bool(args.with_tweedie),
+            tweedie_lags=int(max(args.tweedie_lags, 1)),
+            tweedie_power=float(args.tweedie_power),
+            tweedie_alpha=float(max(args.tweedie_alpha, 0.0)),
+            tweedie_max_iter=int(max(args.tweedie_max_iter, 100)),
         )
     else:
         model_timings = {}
@@ -635,6 +822,16 @@ def main() -> None:
             hb_item_variance_mode=args.hb_item_variance_mode,
             hb_variance_prior_df=hb_variance_prior_df,
             baseline_mode=baseline_mode,
+            with_iets=bool(args.with_iets),
+            iets_rscript=str(args.iets_rscript),
+            iets_script=args.iets_script,
+            iets_occurrence=str(args.iets_occurrence),
+            seed=int(args.seed),
+            with_tweedie=bool(args.with_tweedie),
+            tweedie_lags=int(max(args.tweedie_lags, 1)),
+            tweedie_power=float(args.tweedie_power),
+            tweedie_alpha=float(max(args.tweedie_alpha, 0.0)),
+            tweedie_max_iter=int(max(args.tweedie_max_iter, 100)),
         )
 
     model_cols = [c for c in merged.columns if c not in {"unique_id", "ds", "y"}]

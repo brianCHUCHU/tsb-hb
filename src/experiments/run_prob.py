@@ -38,6 +38,7 @@ from models.hurdle_baselines import (
     predict_hurdle_local_lognormal,
 )
 from models.conformal import fit_predict_conformal_baselines
+from models.tweedie_baseline import fit_predict_tweedie_prob_panel
 from metrics import coverage_rate, pit_values, compute_adi_cv2, classify_adi_cv2
 
 # Optional neural baseline
@@ -57,9 +58,9 @@ def _normalize_prob_baseline_mode(baseline_mode: str | None) -> str:
     mode = str(baseline_mode or "paper").lower()
     if mode == "full":
         mode = "extended"
-    valid = {"paper", "extended", "hurdle_only", "hb_only"}
+    valid = {"paper", "extended", "hurdle_only", "hb_only", "fast_classic"}
     if mode not in valid:
-        raise ValueError("baseline_mode must be one of: paper, extended, full, hurdle_only, hb_only.")
+        raise ValueError("baseline_mode must be one of: paper, extended, full, hurdle_only, hb_only, fast_classic.")
     return mode
 
 
@@ -72,7 +73,7 @@ def _include_hurdle_prob_baselines(baseline_mode: str) -> bool:
 
 
 def _include_conformal_prob_baselines(baseline_mode: str) -> bool:
-    return baseline_mode in {"paper", "extended"}
+    return baseline_mode in {"paper", "extended", "fast_classic"}
 
 
 def _qcols(quantiles: list[float]) -> list[str]:
@@ -145,6 +146,57 @@ def _pinball_mean(eval_merged: pd.DataFrame, quantiles: list[float]) -> float:
     if not losses:
         return float("nan")
     return float(np.mean(losses))
+
+
+def _series_naive_scale(init_set: pd.DataFrame) -> pd.Series:
+    """Per-series scale for normalized pinball (MASE-like denominator)."""
+    tmp = init_set[["unique_id", "ds", "y"]].sort_values(["unique_id", "ds"]).copy()
+    tmp["lag1"] = tmp.groupby("unique_id")["y"].shift(1)
+    tmp["abs_diff"] = (tmp["y"] - tmp["lag1"]).abs()
+    scale = tmp.groupby("unique_id")["abs_diff"].mean()
+    return scale
+
+
+def _scaled_pinball_table(
+    eval_merged: pd.DataFrame,
+    init_set: pd.DataFrame,
+    quantiles: list[float],
+) -> pd.DataFrame:
+    scales = _series_naive_scale(init_set)
+    rows: list[dict[str, float | str | int]] = []
+    for model, dfm in eval_merged.groupby("model"):
+        for q in quantiles:
+            col = f"q_{q}"
+            if col not in dfm.columns:
+                continue
+            dfx = dfm.dropna(subset=[col]).copy()
+            if dfx.empty:
+                continue
+            err = dfx["y"] - dfx[col]
+            dfx["pinball"] = np.maximum(q * err, (q - 1) * err)
+            by_uid = dfx.groupby("unique_id", as_index=False)["pinball"].mean()
+            by_uid["scale"] = by_uid["unique_id"].map(scales)
+            valid = by_uid[(by_uid["scale"] > 0) & np.isfinite(by_uid["scale"])].copy()
+            if valid.empty:
+                rows.append(
+                    {
+                        "model": model,
+                        "quantile": q,
+                        "scaled_pinball": float("nan"),
+                        "n_series_scaled": 0,
+                    }
+                )
+                continue
+            valid["scaled_pinball_uid"] = valid["pinball"] / valid["scale"]
+            rows.append(
+                {
+                    "model": model,
+                    "quantile": q,
+                    "scaled_pinball": float(valid["scaled_pinball_uid"].mean()),
+                    "n_series_scaled": int(valid.shape[0]),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _fit_hb_location_scale(
@@ -314,12 +366,17 @@ def _predict_non_hb_prob_models_once(
     eval_df: pd.DataFrame,
     quantiles: list[float],
     baseline_mode: str = "paper",
+    with_tweedie: bool = False,
+    tweedie_lags: int = 14,
+    tweedie_power: float = 1.5,
+    tweedie_alpha: float = 0.1,
+    tweedie_max_iter: int = 1000,
 ) -> pd.DataFrame:
     qcols = _qcols(quantiles)
     if eval_df.empty:
         return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
     baseline_mode = _normalize_prob_baseline_mode(baseline_mode)
-    if baseline_mode == "hb_only":
+    if baseline_mode == "hb_only" and not with_tweedie:
         return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
 
     frames: list[pd.DataFrame] = []
@@ -350,6 +407,17 @@ def _predict_non_hb_prob_models_once(
         global_q = global_q[["model", "unique_id", "ds"] + qcols]
 
         frames.extend([local_q, global_q])
+    if with_tweedie:
+        tw_q = fit_predict_tweedie_prob_panel(
+            train_df,
+            eval_df,
+            quantiles=quantiles,
+            lags=tweedie_lags,
+            power=tweedie_power,
+            alpha=tweedie_alpha,
+            max_iter=tweedie_max_iter,
+        )
+        frames.append(tw_q)
 
     if not frames:
         return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
@@ -371,6 +439,11 @@ def _predict_prob_models_once(
     baseline_mode: str = "paper",
     include_conformal: bool = False,
     conformal_cal_ratio: float = 0.2,
+    with_tweedie: bool = False,
+    tweedie_lags: int = 14,
+    tweedie_power: float = 1.5,
+    tweedie_alpha: float = 0.1,
+    tweedie_max_iter: int = 1000,
 ) -> pd.DataFrame:
     qcols = _qcols(quantiles)
     if eval_df.empty:
@@ -404,6 +477,11 @@ def _predict_prob_models_once(
         eval_df,
         quantiles,
         baseline_mode=baseline_mode,
+        with_tweedie=with_tweedie,
+        tweedie_lags=tweedie_lags,
+        tweedie_power=tweedie_power,
+        tweedie_alpha=tweedie_alpha,
+        tweedie_max_iter=tweedie_max_iter,
     )
 
     all_frames = [tsbhb_q, non_hb]
@@ -512,6 +590,148 @@ def _predict_deepar_fixed(
             out[c] = np.nan
     out = _enforce_monotonic_quantiles(out, quantiles=quantiles)
     out["model"] = "DeepAR"
+    return out[["model", "unique_id", "ds"] + qcols]
+
+
+def _predict_iets_prob_fixed(
+    init_set: pd.DataFrame,
+    eval_set: pd.DataFrame,
+    quantiles: list[float],
+    *,
+    rscript: str,
+    script_path: Path | None,
+    seed: int,
+    occurrence: str,
+) -> pd.DataFrame:
+    from models.iets_baseline import fit_predict_iets_prob_panel
+
+    return fit_predict_iets_prob_panel(
+        init_set,
+        eval_set,
+        quantiles=quantiles,
+        rscript=rscript,
+        script_path=script_path,
+        seed=seed,
+        occurrence=occurrence,
+    )
+
+
+def _predict_deep_renewal_fixed(
+    init_set: pd.DataFrame,
+    eval_set: pd.DataFrame,
+    quantiles: list[float],
+    horizon: int,
+    context_length: int,
+    num_layers: int,
+    num_cells: int,
+    dropout_rate: float,
+    epochs: int,
+    batches_per_epoch: int,
+    batch_size: int,
+    num_samples: int,
+    learning_rate: float,
+) -> pd.DataFrame:
+    try:
+        from gluonts.dataset.common import ListDataset
+        from gluonts.evaluation.backtest import make_evaluation_predictions
+        from gluonts.mx.model.renewal import DeepRenewalProcessEstimator
+        from gluonts.mx.trainer import Trainer
+    except ImportError as exc:
+        raise ImportError(
+            "Deep Renewal Process requested but GluonTS MXNet components are unavailable. "
+            "Install gluonts and mxnet."
+        ) from exc
+
+    if horizon <= 0:
+        raise ValueError("DeepRenewal horizon must be positive.")
+    qcols = _qcols(quantiles)
+    eval_idx = eval_set[["unique_id", "ds"]].copy()
+    eval_idx["k"] = eval_idx.groupby("unique_id").cumcount()
+    k_max = int(eval_idx["k"].max()) if not eval_idx.empty else -1
+    n_blocks = int(np.ceil((k_max + 1) / horizon)) if k_max >= 0 else 0
+
+    hist = init_set[["unique_id", "ds", "y"]].copy().sort_values(["unique_id", "ds"]).reset_index(drop=True)
+    block_rows: list[pd.DataFrame] = []
+    q_to_name = {0.1: "q_0.1", 0.25: "q_0.25", 0.5: "q_0.5", 0.75: "q_0.75", 0.9: "q_0.9"}
+
+    def _build_list_dataset(source_df: pd.DataFrame) -> "ListDataset":
+        entries = []
+        for uid, grp in source_df.groupby("unique_id", sort=False):
+            g = grp.sort_values("ds")
+            entries.append(
+                {
+                    "item_id": uid,
+                    "start": pd.Timestamp(g["ds"].iloc[0]),
+                    "target": g["y"].to_numpy(dtype=float),
+                }
+            )
+        return ListDataset(entries, freq="D")
+
+    train_ds = _build_list_dataset(hist)
+    estimator = DeepRenewalProcessEstimator(
+        prediction_length=horizon,
+        context_length=max(int(context_length), 1),
+        num_layers=max(int(num_layers), 1),
+        num_cells=max(int(num_cells), 1),
+        dropout_rate=float(max(dropout_rate, 0.0)),
+        batch_size=max(int(batch_size), 1),
+        trainer=Trainer(
+            epochs=max(int(epochs), 1),
+            num_batches_per_epoch=max(int(batches_per_epoch), 1),
+            learning_rate=float(max(learning_rate, 1e-6)),
+        ),
+    )
+    predictor = estimator.train(train_ds)
+
+    for b in range(n_blocks):
+        block_start = b * horizon
+        block_end = block_start + horizon - 1
+        block_eval = eval_idx[(eval_idx["k"] >= block_start) & (eval_idx["k"] <= block_end)].copy()
+        if block_eval.empty:
+            continue
+        infer_ds = _build_list_dataset(hist)
+        fcst_iter, _ = make_evaluation_predictions(
+            dataset=infer_ds,
+            predictor=predictor,
+            num_samples=max(int(num_samples), 100),
+        )
+        forecasts = list(fcst_iter)
+        infer_ids = [entry["item_id"] for entry in infer_ds]
+        if len(forecasts) != len(infer_ids):
+            raise RuntimeError("DeepRenewal forecast count mismatch.")
+
+        rows = []
+        for uid, fcst in zip(infer_ids, forecasts):
+            uid_block = block_eval[block_eval["unique_id"] == uid].sort_values("k")
+            if uid_block.empty:
+                continue
+            n_take = len(uid_block)
+            row = uid_block[["unique_id", "ds"]].copy()
+            for q in quantiles:
+                qf = float(np.clip(q, 1e-6, 1 - 1e-6))
+                vals = np.asarray(fcst.quantile(qf), dtype=float)[:n_take]
+                row[q_to_name.get(q, f"q_{q}")] = vals
+            rows.append(row)
+        if rows:
+            block_out = pd.concat(rows, ignore_index=True)
+            block_rows.append(block_out)
+            advance = block_out[["unique_id", "ds", "q_0.5"]].rename(columns={"q_0.5": "y"})
+            advance["y"] = advance["y"].fillna(0.0)
+            hist = (
+                pd.concat([hist, advance], ignore_index=True)
+                .sort_values(["unique_id", "ds"])
+                .reset_index(drop=True)
+            )
+
+    if not block_rows:
+        return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
+
+    out = pd.concat(block_rows, ignore_index=True)
+    for c in qcols:
+        if c not in out.columns:
+            out[c] = np.nan
+    out = _enforce_monotonic_quantiles(out, quantiles=quantiles)
+    out["model"] = "DeepRenewal"
     return out[["model", "unique_id", "ds"] + qcols]
 
 
@@ -794,11 +1014,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--out", type=Path, default=default_out_dir())
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--max-series", type=int, default=None, help="Optional cap on number of series for faster end-to-end runs.")
     ap.add_argument("--min-len", type=int, default=30)
     ap.add_argument("--init-ratio", type=float, default=1.0 / 3.0)
     ap.add_argument("--protocol", choices=["fixed", "walk_forward"], default="fixed")
     ap.add_argument("--walk-step", type=int, default=1, help="Block size (steps) for walk-forward protocol.")
-    ap.add_argument("--baseline-mode", choices=["paper", "extended", "full", "hurdle_only", "hb_only"], default=None, help="Baseline set for both fixed and walk-forward: paper=TSB-HB + AutoARIMA/AutoTheta + conformal wrappers for point baselines, extended=paper + hurdle baselines, full=legacy alias for extended, hurdle_only=TSB-HB + hurdle baselines, hb_only=TSB-HB only.")
+    ap.add_argument("--baseline-mode", choices=["paper", "extended", "full", "hurdle_only", "hb_only", "fast_classic"], default=None, help="Baseline set for both fixed and walk-forward: paper=TSB-HB + AutoARIMA/AutoTheta + conformal wrappers for point baselines, extended=paper + hurdle baselines, full=legacy alias for extended, hurdle_only=TSB-HB + hurdle baselines, hb_only=TSB-HB only, fast_classic=TSB-HB + conformal wrappers only (no AutoARIMA/AutoTheta/hurdle).")
     ap.add_argument("--hb-regime-aware", dest="hb_regime_aware", action="store_true", default=True, help="Use ADI/CV^2 regime-aware HB priors.")
     ap.add_argument("--no-hb-regime-aware", dest="hb_regime_aware", action="store_false", help="Disable regime-aware priors and use global HB priors.")
     ap.add_argument("--hb-group-shrink-strength", type=float, default=0.0, help="Extra shrink from group-level hyperparameters back to global hyperparameters (0 disables).")
@@ -822,16 +1043,53 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-conformal-baselines", dest="include_conformal", action="store_false", help="Exclude conformal baselines.")
     ap.add_argument("--conformal-cal-ratio", type=float, default=0.2, help="Calibration ratio for conformal prediction split (fraction of training data held out).")
     ap.add_argument("--with-deepar", action="store_true", help="Include DeepAR baseline (fixed protocol only).")
+    ap.add_argument("--with-deep-renewal", action="store_true", help="Include GluonTS Deep Renewal Process baseline (fixed protocol only).")
+    ap.add_argument("--with-tweedie", action="store_true", help="Include Tweedie autoregressive probabilistic baseline.")
+    ap.add_argument("--tweedie-lags", type=int, default=14, help="Number of lag features for Tweedie baseline.")
+    ap.add_argument("--tweedie-power", type=float, default=1.5, help="Tweedie variance power (1<p<2 typical for intermittent demand).")
+    ap.add_argument("--tweedie-alpha", type=float, default=0.1, help="L2 regularization strength for Tweedie baseline.")
+    ap.add_argument("--tweedie-max-iter", type=int, default=1000, help="Max optimizer iterations for Tweedie baseline.")
+    ap.add_argument(
+        "--with-iets",
+        action="store_true",
+        help="Include iETS probabilistic forecasts via R smooth (fixed protocol only; uses prediction intervals).",
+    )
+    ap.add_argument("--iets-rscript", type=str, default="Rscript", help="Rscript executable for iETS.")
+    ap.add_argument(
+        "--iets-script",
+        type=Path,
+        default=None,
+        help="Path to iets_panel_forecast_prob.R (default: <repo>/scripts/iets_panel_forecast_prob.R).",
+    )
+    ap.add_argument(
+        "--iets-occurrence",
+        type=str,
+        default="auto",
+        help="smooth::adam occurrence argument for iETS (e.g. auto, none, fixed).",
+    )
     ap.add_argument("--horizon", type=int, default=10, help="Block size for DeepAR rolling forecast.")
     ap.add_argument("--input-size", type=int, default=14)
     ap.add_argument("--start-padding-enabled", action="store_true", default=True)
     ap.add_argument("--max-steps", type=int, default=500, help="Max training steps for DeepAR.")
+    ap.add_argument("--drp-context-length", type=int, default=30, help="Context length for DeepRenewal.")
+    ap.add_argument("--drp-num-layers", type=int, default=2, help="RNN layers for DeepRenewal.")
+    ap.add_argument("--drp-num-cells", type=int, default=40, help="RNN hidden units for DeepRenewal.")
+    ap.add_argument("--drp-dropout", type=float, default=0.1, help="Dropout for DeepRenewal.")
+    ap.add_argument("--drp-epochs", type=int, default=20, help="Training epochs for DeepRenewal.")
+    ap.add_argument("--drp-batches-per-epoch", type=int, default=50, help="Number of batches per epoch for DeepRenewal.")
+    ap.add_argument("--drp-batch-size", type=int, default=32, help="Batch size for DeepRenewal.")
+    ap.add_argument("--drp-num-samples", type=int, default=400, help="Prediction samples for DeepRenewal.")
+    ap.add_argument("--drp-learning-rate", type=float, default=1e-3, help="Learning rate for DeepRenewal trainer.")
     return ap
 
 
 def run(args: argparse.Namespace) -> None:
     if args.protocol == "walk_forward" and args.with_deepar:
         raise ValueError("--with-deepar is currently supported only for --protocol fixed.")
+    if args.protocol == "walk_forward" and args.with_deep_renewal:
+        raise ValueError("--with-deep-renewal is currently supported only for --protocol fixed.")
+    if args.protocol == "walk_forward" and args.with_iets:
+        raise ValueError("--with-iets is currently supported only for --protocol fixed.")
 
     set_seed(args.seed)
     out_dir: Path = args.out
@@ -843,6 +1101,12 @@ def run(args: argparse.Namespace) -> None:
     else:
         sales_df, calendar_df = load_m5_long(args.m5_sales, args.m5_calendar)
         df = preprocess_m5(sales_df, calendar_df, sample_size=args.m5_sample_size)
+    if args.max_series is not None:
+        max_series = max(int(args.max_series), 1)
+        uids = df["unique_id"].drop_duplicates()
+        if len(uids) > max_series:
+            keep = np.random.choice(uids.to_numpy(), size=max_series, replace=False)
+            df = df[df["unique_id"].isin(keep)].copy()
     init_set, eval_set = train_eval_split_fixed_origin(df, init_ratio=args.init_ratio, min_len=args.min_len)
     if eval_set.empty:
         raise ValueError("Evaluation set is empty; verify split parameters and input data.")
@@ -898,6 +1162,11 @@ def run(args: argparse.Namespace) -> None:
             baseline_mode=baseline_mode,
             include_conformal=bool(args.include_conformal),
             conformal_cal_ratio=float(args.conformal_cal_ratio),
+            with_tweedie=bool(args.with_tweedie),
+            tweedie_lags=int(max(args.tweedie_lags, 1)),
+            tweedie_power=float(args.tweedie_power),
+            tweedie_alpha=float(max(args.tweedie_alpha, 0.0)),
+            tweedie_max_iter=int(max(args.tweedie_max_iter, 100)),
         )
         if args.with_deepar:
             deepar_q = _predict_deepar_fixed(
@@ -910,6 +1179,34 @@ def run(args: argparse.Namespace) -> None:
                 max_steps=args.max_steps,
             )
             all_q = pd.concat([all_q, deepar_q], ignore_index=True)
+        if args.with_deep_renewal:
+            drp_q = _predict_deep_renewal_fixed(
+                init_set=init_set,
+                eval_set=eval_set,
+                quantiles=QUANTILES,
+                horizon=int(args.horizon),
+                context_length=int(args.drp_context_length),
+                num_layers=int(args.drp_num_layers),
+                num_cells=int(args.drp_num_cells),
+                dropout_rate=float(args.drp_dropout),
+                epochs=int(args.drp_epochs),
+                batches_per_epoch=int(args.drp_batches_per_epoch),
+                batch_size=int(args.drp_batch_size),
+                num_samples=int(args.drp_num_samples),
+                learning_rate=float(args.drp_learning_rate),
+            )
+            all_q = pd.concat([all_q, drp_q], ignore_index=True)
+        if args.with_iets:
+            iets_q = _predict_iets_prob_fixed(
+                init_set=init_set,
+                eval_set=eval_set,
+                quantiles=QUANTILES,
+                rscript=str(args.iets_rscript),
+                script_path=args.iets_script,
+                seed=int(args.seed),
+                occurrence=str(args.iets_occurrence),
+            )
+            all_q = pd.concat([all_q, iets_q], ignore_index=True)
     else:
         step_outputs = []
         hb_state = None
@@ -950,6 +1247,11 @@ def run(args: argparse.Namespace) -> None:
                     frame.target,
                     quantiles=QUANTILES,
                     baseline_mode=baseline_mode,
+                    with_tweedie=bool(args.with_tweedie),
+                    tweedie_lags=int(max(args.tweedie_lags, 1)),
+                    tweedie_power=float(args.tweedie_power),
+                    tweedie_alpha=float(max(args.tweedie_alpha, 0.0)),
+                    tweedie_max_iter=int(max(args.tweedie_max_iter, 100)),
                 )
                 step_frames = [tsbhb_q, non_hb_q]
                 if args.include_conformal and _include_conformal_prob_baselines(baseline_mode):
@@ -979,6 +1281,11 @@ def run(args: argparse.Namespace) -> None:
                     baseline_mode=baseline_mode,
                     include_conformal=bool(args.include_conformal),
                     conformal_cal_ratio=float(args.conformal_cal_ratio),
+                    with_tweedie=bool(args.with_tweedie),
+                    tweedie_lags=int(max(args.tweedie_lags, 1)),
+                    tweedie_power=float(args.tweedie_power),
+                    tweedie_alpha=float(max(args.tweedie_alpha, 0.0)),
+                    tweedie_max_iter=int(max(args.tweedie_max_iter, 100)),
                 )
             step_outputs.append(step_q)
         if not step_outputs:
@@ -1002,6 +1309,10 @@ def run(args: argparse.Namespace) -> None:
     pinball_df.insert(0, "protocol", args.protocol)
     pinball_df.to_csv(out_dir / "prob_pinball.csv", index=False)
     pinball_df.to_csv(out_dir / "probabilistic_forecast_pinball_results.csv", index=False)
+    scaled_pinball_df = _scaled_pinball_table(eval_merged, init_set=init_set, quantiles=QUANTILES)
+    if not scaled_pinball_df.empty:
+        scaled_pinball_df.insert(0, "protocol", args.protocol)
+    scaled_pinball_df.to_csv(out_dir / "prob_pinball_scaled.csv", index=False)
 
     coverage_df = _coverage_summary(eval_merged)
     coverage_df.insert(0, "protocol", args.protocol)
@@ -1029,6 +1340,13 @@ def run(args: argparse.Namespace) -> None:
     pit_df.to_csv(out_dir / "pit_values.csv", index=False)
 
     pinball_mean = pinball_df.groupby(["protocol", "model"], as_index=False)["pinball"].mean().rename(columns={"pinball": "pinball_mean"})
+    scaled_pinball_mean = pd.DataFrame(columns=["protocol", "model", "scaled_pinball_mean"])
+    if not scaled_pinball_df.empty:
+        scaled_pinball_mean = (
+            scaled_pinball_df.groupby(["protocol", "model"], as_index=False)["scaled_pinball"]
+            .mean()
+            .rename(columns={"scaled_pinball": "scaled_pinball_mean"})
+        )
     pinball_pos_mean = pd.DataFrame(columns=["protocol", "model", "pinball_mean_pos"])
     if not eval_pos.empty:
         pinball_pos_df = evaluate_prob_models(eval_pos, QUANTILES)
@@ -1037,6 +1355,7 @@ def run(args: argparse.Namespace) -> None:
             pinball_pos_mean = pinball_pos_df.groupby(["protocol", "model"], as_index=False)["pinball"].mean().rename(columns={"pinball": "pinball_mean_pos"})
 
     prob_metrics = coverage_df.merge(pinball_mean, on=["protocol", "model"], how="left")
+    prob_metrics = prob_metrics.merge(scaled_pinball_mean, on=["protocol", "model"], how="left")
     prob_metrics = prob_metrics.merge(coverage_pos_df, on=["protocol", "model"], how="left")
     prob_metrics = prob_metrics.merge(pinball_pos_mean, on=["protocol", "model"], how="left")
     prob_metrics["GoalScore@80"] = prob_metrics["AIW@80"] * (1.0 + prob_metrics["CoverageGap@80"])
