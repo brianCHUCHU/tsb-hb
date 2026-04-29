@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # Panel probabilistic forecasts via iETS: smooth::adam() + forecast(..., interval="prediction").
 # Maps level c(90,80,50) to quantiles 0.1, 0.25, 0.5, 0.75, 0.9 (mean = median point).
-# Usage: Rscript iets_panel_forecast_prob.R <train.csv> <eval.csv> <out.csv> <seed> [occurrence]
+# Usage: Rscript iets_panel_forecast_prob.R <train.csv> <eval.csv> <out.csv> <seed> [occurrence] [per_series_timeout_seconds]
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 4L) {
@@ -16,6 +16,10 @@ if (is.na(seed)) {
   seed <- 42L
 }
 occurrence <- if (length(args) >= 5L) args[[5L]] else "auto"
+per_series_timeout <- if (length(args) >= 6L) suppressWarnings(as.numeric(args[[6L]])) else 10
+if (!is.finite(per_series_timeout) || per_series_timeout <= 0) {
+  per_series_timeout <- 10
+}
 
 suppressPackageStartupMessages({
   if (!requireNamespace("smooth", quietly = TRUE)) {
@@ -53,9 +57,21 @@ eval <- eval[order(eval$unique_id, eval$ds), , drop = FALSE]
 uids <- unique(as.character(eval$unique_id))
 rows <- vector("list", length(uids))
 
-.na_fill_quantiles <- function(h, mu) {
-  mu <- max(mu, 0)
-  m <- matrix(mu, nrow = h, ncol = 5L)
+.fallback_quantiles <- function(h, y) {
+  y <- as.numeric(y)
+  y[!is.finite(y)] <- 0
+  y <- pmax(y, 0)
+  if (length(y) == 0L) {
+    qs <- rep(0, 5L)
+  } else {
+    qs <- as.numeric(stats::quantile(y, probs = c(0.10, 0.25, 0.50, 0.75, 0.90), type = 8, na.rm = TRUE))
+    qs[!is.finite(qs)] <- 0
+    qs <- pmax(qs, 0)
+    for (jj in 2L:length(qs)) {
+      qs[[jj]] <- max(qs[[jj]], qs[[jj - 1L]])
+    }
+  }
+  m <- matrix(qs, nrow = h, ncol = 5L, byrow = TRUE)
   colnames(m) <- c("q_0.1", "q_0.25", "q_0.5", "q_0.75", "q_0.9")
   as.data.frame(m, stringsAsFactors = FALSE)
 }
@@ -74,10 +90,11 @@ for (i in seq_along(uids)) {
   mu0 <- max(mean(y, na.rm = TRUE), 0)
 
   if (length(y) < 5L || sum(y > 0, na.rm = TRUE) < 1L) {
-    qdf <- .na_fill_quantiles(h, 0)
+    qdf <- .fallback_quantiles(h, y)
   } else {
     qdf <- tryCatch(
       {
+        setTimeLimit(elapsed = per_series_timeout, transient = TRUE)
         m <- adam(
           y,
           model = "YYN",
@@ -103,7 +120,7 @@ for (i in seq_along(uids)) {
         qmat <- cbind(q10, q25, q50, q75, q90)
         colnames(qmat) <- c("q_0.1", "q_0.25", "q_0.5", "q_0.75", "q_0.9")
         qmat[!is.finite(qmat)] <- NA_real_
-        qmat <- pmax(qmat, 0, na.rm = TRUE)
+        qmat <- pmax(qmat, 0)
         # Intervals can underflow to ~0 while the mean stays O(1); impute from central path.
         med <- suppressWarnings(apply(qmat, 1L, stats::median, na.rm = TRUE))
         med[!is.finite(med)] <- mu0
@@ -123,7 +140,7 @@ for (i in seq_along(uids)) {
         } else {
           max(mu0, 1, na.rm = TRUE)
         }
-        cap <- y_scale * 200
+        cap <- y_scale * 20
         qmat <- pmin(qmat, cap)
         for (jj in 2L:ncol(qmat)) {
           qmat[, jj] <- pmax(qmat[, jj], qmat[, jj - 1L])
@@ -131,7 +148,10 @@ for (i in seq_along(uids)) {
         as.data.frame(qmat, stringsAsFactors = FALSE)
       },
       error = function(e) {
-        .na_fill_quantiles(h, mu0)
+        .fallback_quantiles(h, y)
+      },
+      finally = {
+        setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE)
       }
     )
   }

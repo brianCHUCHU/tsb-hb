@@ -205,6 +205,8 @@ def _run_m5_point(args: argparse.Namespace, out_dir: Path) -> None:
             script_path=args.iets_script,
             seed=int(args.seed),
             occurrence=str(args.iets_occurrence),
+            timeout_seconds=int(args.iets_timeout) if int(args.iets_timeout) > 0 else None,
+            per_series_timeout_seconds=int(max(args.iets_per_series_timeout, 1)),
         )
         timings[IETS_POINT_COL] = time.perf_counter() - t0
         merged = merged.merge(iets_pred, on=["unique_id", "ds"], how="left")
@@ -325,6 +327,8 @@ def _run_online_point_fixed_with_timing(
     iets_rscript: str = "Rscript",
     iets_script: Path | None = None,
     iets_occurrence: str = "auto",
+    iets_timeout: int | None = 3600,
+    iets_per_series_timeout: int = 10,
     with_tweedie: bool = False,
     tweedie_lags: int = 14,
     tweedie_power: float = 1.5,
@@ -389,6 +393,8 @@ def _run_online_point_fixed_with_timing(
             script_path=iets_script,
             seed=seed,
             occurrence=iets_occurrence,
+            timeout_seconds=iets_timeout,
+            per_series_timeout_seconds=iets_per_series_timeout,
         )
         timings[IETS_POINT_COL] = time.perf_counter() - t0
         merged = merged.merge(iets_pred, on=["unique_id", "ds"], how="left")
@@ -424,6 +430,8 @@ def _run_online_point_walk_forward(
     iets_rscript: str = "Rscript",
     iets_script: Path | None = None,
     iets_occurrence: str = "auto",
+    iets_timeout: int | None = 3600,
+    iets_per_series_timeout: int = 10,
     seed: int = 42,
     with_tweedie: bool = False,
     tweedie_lags: int = 14,
@@ -503,6 +511,8 @@ def _run_online_point_walk_forward(
                 script_path=iets_script,
                 seed=seed,
                 occurrence=iets_occurrence,
+                timeout_seconds=iets_timeout,
+                per_series_timeout_seconds=iets_per_series_timeout,
             )
             # R output can cast ids/dates to different dtypes; align keys before merging.
             merged_step["unique_id"] = merged_step["unique_id"].astype(str)
@@ -759,6 +769,8 @@ def main() -> None:
         default="auto",
         help="adam() occurrence= argument (e.g. auto, direct, fixed, odds-ratio).",
     )
+    ap.add_argument("--iets-timeout", type=int, default=3600, help="Overall timeout in seconds for each iETS R subprocess.")
+    ap.add_argument("--iets-per-series-timeout", type=int, default=10, help="Per-series elapsed-time limit passed to the iETS R script.")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -802,6 +814,8 @@ def main() -> None:
             iets_rscript=str(args.iets_rscript),
             iets_script=args.iets_script,
             iets_occurrence=str(args.iets_occurrence),
+            iets_timeout=int(args.iets_timeout) if int(args.iets_timeout) > 0 else None,
+            iets_per_series_timeout=int(max(args.iets_per_series_timeout, 1)),
             with_tweedie=bool(args.with_tweedie),
             tweedie_lags=int(max(args.tweedie_lags, 1)),
             tweedie_power=float(args.tweedie_power),
@@ -826,6 +840,8 @@ def main() -> None:
             iets_rscript=str(args.iets_rscript),
             iets_script=args.iets_script,
             iets_occurrence=str(args.iets_occurrence),
+            iets_timeout=int(args.iets_timeout) if int(args.iets_timeout) > 0 else None,
+            iets_per_series_timeout=int(max(args.iets_per_series_timeout, 1)),
             seed=int(args.seed),
             with_tweedie=bool(args.with_tweedie),
             tweedie_lags=int(max(args.tweedie_lags, 1)),

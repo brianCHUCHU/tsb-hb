@@ -602,6 +602,8 @@ def _predict_iets_prob_fixed(
     script_path: Path | None,
     seed: int,
     occurrence: str,
+    timeout_seconds: int | None,
+    per_series_timeout_seconds: int,
 ) -> pd.DataFrame:
     from models.iets_baseline import fit_predict_iets_prob_panel
 
@@ -613,6 +615,8 @@ def _predict_iets_prob_fixed(
         script_path=script_path,
         seed=seed,
         occurrence=occurrence,
+        timeout_seconds=timeout_seconds,
+        per_series_timeout_seconds=per_series_timeout_seconds,
     )
 
 
@@ -1067,6 +1071,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="smooth::adam occurrence argument for iETS (e.g. auto, none, fixed).",
     )
+    ap.add_argument("--iets-timeout", type=int, default=3600, help="Overall timeout in seconds for the iETS R subprocess.")
+    ap.add_argument("--iets-per-series-timeout", type=int, default=10, help="Per-series elapsed-time limit passed to the iETS R script.")
     ap.add_argument("--horizon", type=int, default=10, help="Block size for DeepAR rolling forecast.")
     ap.add_argument("--input-size", type=int, default=14)
     ap.add_argument("--start-padding-enabled", action="store_true", default=True)
@@ -1205,6 +1211,8 @@ def run(args: argparse.Namespace) -> None:
                 script_path=args.iets_script,
                 seed=int(args.seed),
                 occurrence=str(args.iets_occurrence),
+                timeout_seconds=int(args.iets_timeout) if int(args.iets_timeout) > 0 else None,
+                per_series_timeout_seconds=int(max(args.iets_per_series_timeout, 1)),
             )
             all_q = pd.concat([all_q, iets_q], ignore_index=True)
     else:

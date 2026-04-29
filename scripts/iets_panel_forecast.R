@@ -1,6 +1,6 @@
 #!/usr/bin/env Rscript
 # Panel point forecasts via iETS (intermittent ETS) using smooth::adam().
-# Usage: Rscript iets_panel_forecast.R <train.csv> <eval.csv> <out.csv> <seed> [occurrence]
+# Usage: Rscript iets_panel_forecast.R <train.csv> <eval.csv> <out.csv> <seed> [occurrence] [per_series_timeout_seconds]
 #   train.csv / eval.csv: columns unique_id, ds, y
 #   occurrence: passed to adam(..., occurrence=) — default "auto"
 
@@ -17,6 +17,10 @@ if (is.na(seed)) {
   seed <- 42L
 }
 occurrence <- if (length(args) >= 5L) args[[5L]] else "auto"
+per_series_timeout <- if (length(args) >= 6L) suppressWarnings(as.numeric(args[[6L]])) else 10
+if (!is.finite(per_series_timeout) || per_series_timeout <= 0) {
+  per_series_timeout <- 10
+}
 
 suppressPackageStartupMessages({
   if (!requireNamespace("smooth", quietly = TRUE)) {
@@ -89,6 +93,7 @@ for (i in seq_along(uids)) {
   } else {
     yhat <- tryCatch(
       {
+        setTimeLimit(elapsed = per_series_timeout, transient = TRUE)
         m <- adam(
           y,
           model = "YYN",
@@ -109,12 +114,15 @@ for (i in seq_along(uids)) {
         } else {
           max(mean(y, na.rm = TRUE), 1, na.rm = TRUE)
         }
-        v <- pmin(v, y_scale * 200)
+        v <- pmin(v, y_scale * 20)
         v[!is.finite(v)] <- 0
         v
       },
       error = function(e) {
         rep(max(mean(y, na.rm = TRUE), 0), h)
+      },
+      finally = {
+        setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE)
       }
     )
   }

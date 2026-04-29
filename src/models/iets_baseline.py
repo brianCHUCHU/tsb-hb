@@ -52,6 +52,8 @@ def fit_predict_iets_panel(
     script_path: Path | None = None,
     seed: int = 42,
     occurrence: str = "auto",
+    timeout_seconds: int | None = 3600,
+    per_series_timeout_seconds: int = 10,
 ) -> pd.DataFrame:
     """Run R smooth::adam iETS panel forecasts; returns [unique_id, ds, iETS].
 
@@ -85,19 +87,32 @@ def fit_predict_iets_panel(
             str(out_csv),
             str(int(seed)),
             str(occurrence),
+            str(int(max(per_series_timeout_seconds, 1))),
         ]
         env = os.environ.copy()
         r_user_lib = find_repo_root() / ".R" / "library"
         if r_user_lib.is_dir():
             env["R_LIBS_USER"] = str(r_user_lib)
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=timeout_seconds,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"iETS (R) failed because '{rscript}' was not found. Install R and put Rscript on PATH, "
+                "or pass --iets-rscript /absolute/path/to/Rscript."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"iETS (R) exceeded timeout_seconds={timeout_seconds}. "
+                "Use --max-series for a sampled run or lower --iets-per-series-timeout."
+            ) from exc
         if proc.returncode != 0:
             msg = (proc.stderr or proc.stdout or "").strip()
             raise RuntimeError(
@@ -126,6 +141,8 @@ def fit_predict_iets_prob_panel(
     seed: int = 42,
     occurrence: str = "auto",
     model_name: str = IETS_PROB_MODEL,
+    timeout_seconds: int | None = 3600,
+    per_series_timeout_seconds: int = 10,
 ) -> pd.DataFrame:
     """Run iETS probabilistic forecasts via R; returns long frame like run_prob baselines.
 
@@ -160,19 +177,32 @@ def fit_predict_iets_prob_panel(
             str(out_csv),
             str(int(seed)),
             str(occurrence),
+            str(int(max(per_series_timeout_seconds, 1))),
         ]
         env = os.environ.copy()
         r_user_lib = find_repo_root() / ".R" / "library"
         if r_user_lib.is_dir():
             env["R_LIBS_USER"] = str(r_user_lib)
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=timeout_seconds,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"iETS probabilistic (R) failed because '{rscript}' was not found. Install R and put Rscript on PATH, "
+                "or pass --iets-rscript /absolute/path/to/Rscript."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"iETS probabilistic (R) exceeded timeout_seconds={timeout_seconds}. "
+                "Use --max-series for a sampled run or lower --iets-per-series-timeout."
+            ) from exc
         if proc.returncode != 0:
             msg = (proc.stderr or proc.stdout or "").strip()
             raise RuntimeError(
