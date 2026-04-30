@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import subprocess
 import tempfile
@@ -143,6 +144,8 @@ def fit_predict_iets_prob_panel(
     model_name: str = IETS_PROB_MODEL,
     timeout_seconds: int | None = 3600,
     per_series_timeout_seconds: int = 10,
+    n_jobs: int = 1,
+    cache_path: Path | None = None,
 ) -> pd.DataFrame:
     """Run iETS probabilistic forecasts via R; returns long frame like run_prob baselines.
 
@@ -161,6 +164,95 @@ def fit_predict_iets_prob_panel(
         raise ValueError(f"eval_df must contain columns {need_eval}")
 
     qcols = _qcols(quantiles)
+    if cache_path is not None and cache_path.is_file():
+        cached = pd.read_csv(cache_path)
+        cached["ds"] = pd.to_datetime(cached["ds"])
+        for c in qcols:
+            if c not in cached.columns:
+                cached[c] = np.nan
+        cached = _enforce_monotonic_quantiles(cached, quantiles=quantiles)
+        cached["model"] = model_name
+        return cached[["model", "unique_id", "ds"] + qcols].copy()
+
+    n_jobs = int(max(n_jobs, 1))
+    if n_jobs > 1:
+        uids = np.asarray(eval_df["unique_id"].astype(str).drop_duplicates().to_list(), dtype=object)
+        if len(uids) == 0:
+            return pd.DataFrame(columns=["model", "unique_id", "ds"] + qcols)
+        chunks = [chunk.tolist() for chunk in np.array_split(uids, min(n_jobs, len(uids))) if len(chunk) > 0]
+        frames: list[pd.DataFrame] = []
+        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            futures = {}
+            for job_idx, chunk_uids in enumerate(chunks, start=1):
+                eval_chunk = eval_df[eval_df["unique_id"].astype(str).isin(chunk_uids)].copy()
+                train_chunk = train_df[train_df["unique_id"].astype(str).isin(chunk_uids)].copy()
+                futures[
+                    executor.submit(
+                        _run_iets_prob_r_script,
+                        train_chunk,
+                        eval_chunk,
+                        rscript=rscript,
+                        script=script,
+                        seed=seed,
+                        occurrence=occurrence,
+                        timeout_seconds=timeout_seconds,
+                        per_series_timeout_seconds=per_series_timeout_seconds,
+                    )
+                ] = job_idx
+            for future in as_completed(futures):
+                job_idx = futures[future]
+                try:
+                    frames.append(future.result())
+                except Exception as exc:
+                    raise RuntimeError(f"iETS probabilistic worker {job_idx}/{len(chunks)} failed.") from exc
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["unique_id", "ds"] + qcols)
+        out["ds"] = pd.to_datetime(out["ds"])
+        for c in qcols:
+            if c not in out.columns:
+                out[c] = np.nan
+        out = _enforce_monotonic_quantiles(out, quantiles=quantiles)
+        out["model"] = model_name
+        final = out[["model", "unique_id", "ds"] + qcols].copy()
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            final.to_csv(cache_path, index=False)
+        return final
+
+    out = _run_iets_prob_r_script(
+        train_df,
+        eval_df,
+        rscript=rscript,
+        script=script,
+        seed=seed,
+        occurrence=occurrence,
+        timeout_seconds=timeout_seconds,
+        per_series_timeout_seconds=per_series_timeout_seconds,
+    )
+    out["ds"] = pd.to_datetime(out["ds"])
+    for c in qcols:
+        if c not in out.columns:
+            out[c] = np.nan
+    out = _enforce_monotonic_quantiles(out, quantiles=quantiles)
+    out["model"] = model_name
+    final = out[["model", "unique_id", "ds"] + qcols].copy()
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        final.to_csv(cache_path, index=False)
+    return final
+
+
+def _run_iets_prob_r_script(
+    train_df: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    *,
+    rscript: str,
+    script: Path,
+    seed: int,
+    occurrence: str,
+    timeout_seconds: int | None,
+    per_series_timeout_seconds: int,
+) -> pd.DataFrame:
+    need_train = {"unique_id", "ds", "y"}
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         train_csv = tmp_path / "train.csv"
@@ -213,10 +305,4 @@ def fit_predict_iets_prob_panel(
             raise RuntimeError(f"iETS prob output missing: {out_csv}")
 
         out = pd.read_csv(out_csv)
-        out["ds"] = pd.to_datetime(out["ds"])
-        for c in qcols:
-            if c not in out.columns:
-                out[c] = np.nan
-        out = _enforce_monotonic_quantiles(out, quantiles=quantiles)
-        out["model"] = model_name
-        return out[["model", "unique_id", "ds"] + qcols].copy()
+        return out
