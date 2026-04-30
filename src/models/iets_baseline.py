@@ -124,10 +124,11 @@ def fit_predict_iets_panel(
         if not out_csv.is_file():
             raise RuntimeError(f"iETS output missing: {out_csv}")
 
-        out = pd.read_csv(out_csv)
+        out = pd.read_csv(out_csv, dtype={"unique_id": str})
         if IETS_POINT_COL not in out.columns:
             raise RuntimeError(f"iETS output missing column '{IETS_POINT_COL}': {list(out.columns)}")
         out = out[["unique_id", "ds", IETS_POINT_COL]].copy()
+        out["unique_id"] = out["unique_id"].astype(str)
         out["ds"] = pd.to_datetime(out["ds"])
         return out
 
@@ -165,7 +166,8 @@ def fit_predict_iets_prob_panel(
 
     qcols = _qcols(quantiles)
     if cache_path is not None and cache_path.is_file():
-        cached = pd.read_csv(cache_path)
+        cached = pd.read_csv(cache_path, dtype={"unique_id": str})
+        cached["unique_id"] = cached["unique_id"].astype(str)
         cached["ds"] = pd.to_datetime(cached["ds"])
         for c in qcols:
             if c not in cached.columns:
@@ -207,6 +209,7 @@ def fit_predict_iets_prob_panel(
                 except Exception as exc:
                     raise RuntimeError(f"iETS probabilistic worker {job_idx}/{len(chunks)} failed.") from exc
         out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["unique_id", "ds"] + qcols)
+        out["unique_id"] = out["unique_id"].astype(str)
         out["ds"] = pd.to_datetime(out["ds"])
         for c in qcols:
             if c not in out.columns:
@@ -230,6 +233,7 @@ def fit_predict_iets_prob_panel(
         per_series_timeout_seconds=per_series_timeout_seconds,
         quantiles=quantiles,
     )
+    out["unique_id"] = out["unique_id"].astype(str)
     out["ds"] = pd.to_datetime(out["ds"])
     for c in qcols:
         if c not in out.columns:
@@ -308,5 +312,6 @@ def _run_iets_prob_r_script(
         if not out_csv.is_file():
             raise RuntimeError(f"iETS prob output missing: {out_csv}")
 
-        out = pd.read_csv(out_csv)
+        out = pd.read_csv(out_csv, dtype={"unique_id": str})
+        out["unique_id"] = out["unique_id"].astype(str)
         return out

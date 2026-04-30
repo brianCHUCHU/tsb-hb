@@ -1180,6 +1180,8 @@ def run(args: argparse.Namespace) -> None:
             keep = np.random.choice(uids.to_numpy(), size=max_series, replace=False)
             df = df[df["unique_id"].isin(keep)].copy()
     init_set, eval_set = train_eval_split_fixed_origin(df, init_ratio=args.init_ratio, min_len=args.min_len)
+    init_set["unique_id"] = init_set["unique_id"].astype(str)
+    eval_set["unique_id"] = eval_set["unique_id"].astype(str)
     if eval_set.empty:
         raise ValueError("Evaluation set is empty; verify split parameters and input data.")
 
@@ -1370,6 +1372,8 @@ def run(args: argparse.Namespace) -> None:
         else:
             all_q = pd.concat(step_outputs, ignore_index=True)
 
+    all_q["unique_id"] = all_q["unique_id"].astype(str)
+    all_q["ds"] = pd.to_datetime(all_q["ds"])
     all_q = all_q.sort_values(["model", "unique_id", "ds"]).reset_index(drop=True)
     all_q_out = all_q.copy()
     all_q_out.insert(0, "protocol", args.protocol)
