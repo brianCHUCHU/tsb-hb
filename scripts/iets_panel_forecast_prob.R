@@ -1,6 +1,6 @@
 #!/usr/bin/env Rscript
 # Panel probabilistic forecasts via iETS: smooth::adam() + forecast(..., interval="prediction").
-# Maps level c(90,80,50) to quantiles 0.1, 0.25, 0.5, 0.75, 0.9 (mean = median point).
+# Maps level c(90,80,50) to quantiles 0.1, 0.25, 0.5, 0.75, 0.9.
 # Usage: Rscript iets_panel_forecast_prob.R <train.csv> <eval.csv> <out.csv> <seed> [occurrence] [per_series_timeout_seconds]
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -114,21 +114,19 @@ for (i in seq_along(uids)) {
         # level = c(90, 80, 50): column 2 is 80% PI, column 3 is 50% PI.
         q10 <- as.numeric(L[, 2L])
         q25 <- as.numeric(L[, 3L])
-        q50 <- as.numeric(mean_v)
         q75 <- as.numeric(U[, 3L])
         q90 <- as.numeric(U[, 2L])
+        q50 <- 0.5 * (q25 + q75)
+        bad_q50 <- !is.finite(q50)
+        q50[bad_q50] <- mean_v[bad_q50]
         qmat <- cbind(q10, q25, q50, q75, q90)
         colnames(qmat) <- c("q_0.1", "q_0.25", "q_0.5", "q_0.75", "q_0.9")
         qmat[!is.finite(qmat)] <- NA_real_
         qmat <- pmax(qmat, 0)
-        # Intervals can underflow to ~0 while the mean stays O(1); impute from central path.
         med <- suppressWarnings(apply(qmat, 1L, stats::median, na.rm = TRUE))
         med[!is.finite(med)] <- mu0
         for (cc in seq_len(ncol(qmat))) {
           bad <- !is.finite(qmat[, cc])
-          if (cc <= 2L) {
-            bad <- bad | (qmat[, cc] < 1e-8 & med > 1e-6)
-          }
           qmat[bad, cc] <- med[bad]
         }
         for (jj in 2L:ncol(qmat)) {
