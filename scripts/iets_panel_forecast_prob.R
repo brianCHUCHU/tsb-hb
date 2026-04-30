@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # Panel probabilistic forecasts via iETS: smooth::adam() + forecast(..., interval="prediction").
-# Maps level c(90,80,50) to quantiles 0.1, 0.25, 0.5, 0.75, 0.9.
-# Usage: Rscript iets_panel_forecast_prob.R <train.csv> <eval.csv> <out.csv> <seed> [occurrence] [per_series_timeout_seconds]
+# Maps central prediction intervals to requested quantiles.
+# Usage: Rscript iets_panel_forecast_prob.R <train.csv> <eval.csv> <out.csv> <seed> [occurrence] [per_series_timeout_seconds] [quantiles]
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 4L) {
@@ -19,6 +19,32 @@ occurrence <- if (length(args) >= 5L) args[[5L]] else "auto"
 per_series_timeout <- if (length(args) >= 6L) suppressWarnings(as.numeric(args[[6L]])) else 10
 if (!is.finite(per_series_timeout) || per_series_timeout <= 0) {
   per_series_timeout <- 10
+}
+quantile_arg <- if (length(args) >= 7L) args[[7L]] else "0.1,0.25,0.5,0.75,0.9"
+
+.parse_quantiles <- function(x) {
+  vals <- suppressWarnings(as.numeric(strsplit(gsub(";", ",", x), ",", fixed = FALSE)[[1L]]))
+  vals <- vals[is.finite(vals)]
+  vals[vals > 1] <- vals[vals > 1] / 100
+  vals <- sort(unique(vals[vals > 0 & vals < 1]))
+  if (length(vals) == 0L) {
+    stop("No valid quantiles supplied.")
+  }
+  vals
+}
+
+requested_probs <- .parse_quantiles(quantile_arg)
+requested_cols <- paste0("q_", requested_probs)
+needed_levels <- c()
+if (any(requested_probs %in% c(0.1, 0.9))) {
+  needed_levels <- c(needed_levels, 80)
+}
+if (any(requested_probs %in% c(0.25, 0.5, 0.75))) {
+  needed_levels <- c(needed_levels, 50)
+}
+needed_levels <- sort(unique(needed_levels), decreasing = TRUE)
+if (length(needed_levels) == 0L) {
+  stop("iETS R script supports quantiles among 0.1, 0.25, 0.5, 0.75, 0.9.")
 }
 
 suppressPackageStartupMessages({
@@ -62,18 +88,26 @@ rows <- vector("list", length(uids))
   y[!is.finite(y)] <- 0
   y <- pmax(y, 0)
   if (length(y) == 0L) {
-    qs <- rep(0, 5L)
+    qs <- rep(0, length(requested_probs))
   } else {
-    qs <- as.numeric(stats::quantile(y, probs = c(0.10, 0.25, 0.50, 0.75, 0.90), type = 8, na.rm = TRUE))
+    qs <- as.numeric(stats::quantile(y, probs = requested_probs, type = 8, na.rm = TRUE))
     qs[!is.finite(qs)] <- 0
     qs <- pmax(qs, 0)
     for (jj in 2L:length(qs)) {
       qs[[jj]] <- max(qs[[jj]], qs[[jj - 1L]])
     }
   }
-  m <- matrix(qs, nrow = h, ncol = 5L, byrow = TRUE)
-  colnames(m) <- c("q_0.1", "q_0.25", "q_0.5", "q_0.75", "q_0.9")
+  m <- matrix(qs, nrow = h, ncol = length(requested_probs), byrow = TRUE)
+  colnames(m) <- requested_cols
   as.data.frame(m, stringsAsFactors = FALSE)
+}
+
+.interval_col <- function(levels, target) {
+  idx <- which(as.numeric(levels) == as.numeric(target))
+  if (length(idx) == 0L) {
+    return(NA_integer_)
+  }
+  idx[[1L]]
 }
 
 for (i in seq_along(uids)) {
@@ -101,26 +135,28 @@ for (i in seq_along(uids)) {
           occurrence = occurrence,
           h = h
         )
-        fc <- forecast(m, h = h, interval = "prediction", level = c(90, 80, 50))
+        fc <- forecast(m, h = h, interval = "prediction", level = needed_levels)
         mean_v <- as.numeric(fc$mean)
         if (length(mean_v) != h) {
           mean_v <- rep(mu0, h)
         }
         L <- as.matrix(fc$lower)
         U <- as.matrix(fc$upper)
-        if (nrow(L) != h || ncol(L) < 3L || nrow(U) != h || ncol(U) < 3L) {
+        if (nrow(L) != h || nrow(U) != h) {
           stop("unexpected forecast lower/upper dimensions")
         }
-        # level = c(90, 80, 50): column 2 is 80% PI, column 3 is 50% PI.
-        q10 <- as.numeric(L[, 2L])
-        q25 <- as.numeric(L[, 3L])
-        q75 <- as.numeric(U[, 3L])
-        q90 <- as.numeric(U[, 2L])
+        col80 <- .interval_col(needed_levels, 80)
+        col50 <- .interval_col(needed_levels, 50)
+        q10 <- if (is.finite(col80)) as.numeric(L[, col80]) else rep(NA_real_, h)
+        q25 <- if (is.finite(col50)) as.numeric(L[, col50]) else rep(NA_real_, h)
+        q75 <- if (is.finite(col50)) as.numeric(U[, col50]) else rep(NA_real_, h)
+        q90 <- if (is.finite(col80)) as.numeric(U[, col80]) else rep(NA_real_, h)
         q50 <- 0.5 * (q25 + q75)
         bad_q50 <- !is.finite(q50)
         q50[bad_q50] <- mean_v[bad_q50]
-        qmat <- cbind(q10, q25, q50, q75, q90)
-        colnames(qmat) <- c("q_0.1", "q_0.25", "q_0.5", "q_0.75", "q_0.9")
+        qmat_all <- cbind(q10, q25, q50, q75, q90)
+        colnames(qmat_all) <- c("q_0.1", "q_0.25", "q_0.5", "q_0.75", "q_0.9")
+        qmat <- qmat_all[, requested_cols, drop = FALSE]
         qmat[!is.finite(qmat)] <- NA_real_
         qmat <- pmax(qmat, 0)
         med <- suppressWarnings(apply(qmat, 1L, stats::median, na.rm = TRUE))
@@ -157,7 +193,7 @@ for (i in seq_along(uids)) {
   rows[[i]] <- data.frame(
     unique_id = uid,
     ds = ev$ds,
-    qdf,
+    qdf[, requested_cols, drop = FALSE],
     stringsAsFactors = FALSE
   )
 }
@@ -166,13 +202,11 @@ out <- do.call(rbind, rows)
 if (is.null(out) || nrow(out) == 0L) {
   out <- data.frame(
     unique_id = character(),
-    ds = character(),
-    q_0.1 = numeric(),
-    q_0.25 = numeric(),
-    q_0.5 = numeric(),
-    q_0.75 = numeric(),
-    q_0.9 = numeric()
+    ds = character()
   )
+  for (cc in requested_cols) {
+    out[[cc]] <- numeric()
+  }
 }
 
 write.csv(out, out_path, row.names = FALSE)

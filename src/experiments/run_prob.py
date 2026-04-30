@@ -80,6 +80,34 @@ def _qcols(quantiles: list[float]) -> list[str]:
     return [f"q_{q}" for q in quantiles]
 
 
+def _parse_quantiles(raw: str | None) -> list[float]:
+    if raw is None or str(raw).strip() == "":
+        return QUANTILES.copy()
+    vals: list[float] = []
+    for part in str(raw).replace(";", ",").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        q = float(token)
+        if q > 1.0:
+            q = q / 100.0
+        if not 0.0 < q < 1.0:
+            raise ValueError("--quantiles values must be in (0,1), or percentages like 50,75,90.")
+        vals.append(round(q, 6))
+    vals = sorted(set(vals))
+    if not vals:
+        raise ValueError("--quantiles did not contain any valid values.")
+    return vals
+
+
+def _has_qcols(df: pd.DataFrame, quantiles: list[float]) -> bool:
+    return all(f"q_{q}" in df.columns for q in quantiles)
+
+
+def _supports_standard_coverage(df: pd.DataFrame) -> bool:
+    return _has_qcols(df, [0.1, 0.25, 0.75, 0.9])
+
+
 def _build_regime_group_labels(train_df: pd.DataFrame) -> pd.Series | None:
     feats = compute_adi_cv2(train_df)
     if feats.empty:
@@ -273,10 +301,14 @@ def _fit_hb_location_scale(
         pin = _pinball_mean(merged, quantiles=quantiles)
         if not np.isfinite(pin):
             continue
-        cov50 = coverage_rate(merged, 0.25, 0.75, 0.5)["Coverage@50"]
-        cov80 = coverage_rate(merged, 0.1, 0.9, 0.8)["Coverage@80"]
-        gap50 = abs(float(cov50) - 0.5)
-        gap80 = abs(float(cov80) - 0.8)
+        if _supports_standard_coverage(merged):
+            cov50 = coverage_rate(merged, 0.25, 0.75, 0.5)["Coverage@50"]
+            cov80 = coverage_rate(merged, 0.1, 0.9, 0.8)["Coverage@80"]
+            gap50 = abs(float(cov50) - 0.5)
+            gap80 = abs(float(cov80) - 0.8)
+        else:
+            gap50 = 0.0
+            gap80 = 0.0
         obj = float(pin + w_cov * (gap50 + gap80))
         if obj < best_obj:
             best_obj = obj
@@ -806,13 +838,19 @@ def plot_pit_histogram(eval_merged: pd.DataFrame, quantiles: list[float], out_di
 def _coverage_summary(eval_merged: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for model, dfm in eval_merged.groupby("model"):
-        cov50 = coverage_rate(dfm, 0.25, 0.75, 0.5)
-        cov80 = coverage_rate(dfm, 0.1, 0.9, 0.8)
         row = {"model": model, "n_obs": int(len(dfm))}
-        row.update(cov50)
-        row.update(cov80)
-        row["CoverageGap@50"] = float(abs(cov50["Coverage@50"] - 0.50))
-        row["CoverageGap@80"] = float(abs(cov80["Coverage@80"] - 0.80))
+        if _has_qcols(dfm, [0.25, 0.75]):
+            cov50 = coverage_rate(dfm, 0.25, 0.75, 0.5)
+            row.update(cov50)
+            row["CoverageGap@50"] = float(abs(cov50["Coverage@50"] - 0.50))
+        else:
+            row.update({"Coverage@50": np.nan, "AIW@50": np.nan, "CoverageGap@50": np.nan})
+        if _has_qcols(dfm, [0.1, 0.9]):
+            cov80 = coverage_rate(dfm, 0.1, 0.9, 0.8)
+            row.update(cov80)
+            row["CoverageGap@80"] = float(abs(cov80["Coverage@80"] - 0.80))
+        else:
+            row.update({"Coverage@80": np.nan, "AIW@80": np.nan, "CoverageGap@80": np.nan})
         rows.append(row)
     if not rows:
         return pd.DataFrame(
@@ -886,19 +924,27 @@ def _ordered_slice_values(slice_type: str, values: pd.Series) -> list[str]:
 
 
 def _prob_metric_row(dfm: pd.DataFrame, quantiles: list[float]) -> dict[str, float]:
-    cov50 = coverage_rate(dfm, 0.25, 0.75, 0.5)
-    cov80 = coverage_rate(dfm, 0.1, 0.9, 0.8)
     pin = evaluate_prob_models(dfm, quantiles=quantiles)
     pin_mean = float(pin["pinball"].mean()) if not pin.empty else float("nan")
     row = {
-        "Coverage@50": float(cov50["Coverage@50"]),
-        "AIW@50": float(cov50["AIW@50"]),
-        "Coverage@80": float(cov80["Coverage@80"]),
-        "AIW@80": float(cov80["AIW@80"]),
-        "CoverageGap@50": float(abs(float(cov50["Coverage@50"]) - 0.50)),
-        "CoverageGap@80": float(abs(float(cov80["Coverage@80"]) - 0.80)),
+        "Coverage@50": np.nan,
+        "AIW@50": np.nan,
+        "Coverage@80": np.nan,
+        "AIW@80": np.nan,
+        "CoverageGap@50": np.nan,
+        "CoverageGap@80": np.nan,
         "pinball_mean": pin_mean,
     }
+    if _has_qcols(dfm, [0.25, 0.75]):
+        cov50 = coverage_rate(dfm, 0.25, 0.75, 0.5)
+        row["Coverage@50"] = float(cov50["Coverage@50"])
+        row["AIW@50"] = float(cov50["AIW@50"])
+        row["CoverageGap@50"] = float(abs(float(cov50["Coverage@50"]) - 0.50))
+    if _has_qcols(dfm, [0.1, 0.9]):
+        cov80 = coverage_rate(dfm, 0.1, 0.9, 0.8)
+        row["Coverage@80"] = float(cov80["Coverage@80"])
+        row["AIW@80"] = float(cov80["AIW@80"])
+        row["CoverageGap@80"] = float(abs(float(cov80["Coverage@80"]) - 0.80))
     row["GoalScore@80"] = row["AIW@80"] * (1.0 + row["CoverageGap@80"])
 
     dfp = dfm[dfm["y"] > 0].copy()
@@ -918,22 +964,30 @@ def _prob_metric_row(dfm: pd.DataFrame, quantiles: list[float]) -> dict[str, flo
         )
         return row
 
-    cov50_pos = coverage_rate(dfp, 0.25, 0.75, 0.5)
-    cov80_pos = coverage_rate(dfp, 0.1, 0.9, 0.8)
     pin_pos = evaluate_prob_models(dfp, quantiles=quantiles)
     pin_pos_mean = float(pin_pos["pinball"].mean()) if not pin_pos.empty else float("nan")
 
     row.update(
         {
-            "Coverage@50_pos": float(cov50_pos["Coverage@50"]),
-            "AIW@50_pos": float(cov50_pos["AIW@50"]),
-            "Coverage@80_pos": float(cov80_pos["Coverage@80"]),
-            "AIW@80_pos": float(cov80_pos["AIW@80"]),
-            "CoverageGap@50_pos": float(abs(float(cov50_pos["Coverage@50"]) - 0.50)),
-            "CoverageGap@80_pos": float(abs(float(cov80_pos["Coverage@80"]) - 0.80)),
+            "Coverage@50_pos": np.nan,
+            "AIW@50_pos": np.nan,
+            "Coverage@80_pos": np.nan,
+            "AIW@80_pos": np.nan,
+            "CoverageGap@50_pos": np.nan,
+            "CoverageGap@80_pos": np.nan,
             "pinball_mean_pos": pin_pos_mean,
         }
     )
+    if _has_qcols(dfp, [0.25, 0.75]):
+        cov50_pos = coverage_rate(dfp, 0.25, 0.75, 0.5)
+        row["Coverage@50_pos"] = float(cov50_pos["Coverage@50"])
+        row["AIW@50_pos"] = float(cov50_pos["AIW@50"])
+        row["CoverageGap@50_pos"] = float(abs(float(cov50_pos["Coverage@50"]) - 0.50))
+    if _has_qcols(dfp, [0.1, 0.9]):
+        cov80_pos = coverage_rate(dfp, 0.1, 0.9, 0.8)
+        row["Coverage@80_pos"] = float(cov80_pos["Coverage@80"])
+        row["AIW@80_pos"] = float(cov80_pos["AIW@80"])
+        row["CoverageGap@80_pos"] = float(abs(float(cov80_pos["Coverage@80"]) - 0.80))
     row["GoalScore@80_pos"] = row["AIW@80_pos"] * (1.0 + row["CoverageGap@80_pos"])
     return row
 
@@ -1025,6 +1079,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-series", type=int, default=None, help="Optional cap on number of series for faster end-to-end runs.")
     ap.add_argument("--min-len", type=int, default=30)
     ap.add_argument("--init-ratio", type=float, default=1.0 / 3.0)
+    ap.add_argument(
+        "--quantiles",
+        type=str,
+        default="0.1,0.25,0.5,0.75,0.9",
+        help="Comma-separated quantiles to forecast/evaluate. Values may be probabilities or percentages, e.g. 0.5,0.75,0.9 or 50,75,90.",
+    )
     ap.add_argument("--protocol", choices=["fixed", "walk_forward"], default="fixed")
     ap.add_argument("--walk-step", type=int, default=1, help="Block size (steps) for walk-forward protocol.")
     ap.add_argument("--baseline-mode", choices=["paper", "extended", "full", "hurdle_only", "hb_only", "fast_classic"], default=None, help="Baseline set for both fixed and walk-forward: paper=TSB-HB + AutoARIMA/AutoTheta + conformal wrappers for point baselines, extended=paper + hurdle baselines, full=legacy alias for extended, hurdle_only=TSB-HB + hurdle baselines, hb_only=TSB-HB only, fast_classic=TSB-HB + conformal wrappers only (no AutoARIMA/AutoTheta/hurdle).")
@@ -1123,7 +1183,8 @@ def run(args: argparse.Namespace) -> None:
     if eval_set.empty:
         raise ValueError("Evaluation set is empty; verify split parameters and input data.")
 
-    qcols = _qcols(QUANTILES)
+    quantiles = _parse_quantiles(args.quantiles)
+    qcols = _qcols(quantiles)
     hb_group_labels = _build_regime_group_labels(init_set) if args.hb_regime_aware else None
     hb_use_hyper_uncertainty = (not args.hb_disable_hyper_uncertainty) and (args.hb_bootstrap_draws > 0)
     baseline_mode = _normalize_prob_baseline_mode(args.baseline_mode)
@@ -1132,7 +1193,7 @@ def run(args: argparse.Namespace) -> None:
     if args.hb_calibration_mode == "location_scale":
         hb_calibration = _fit_hb_location_scale(
             init_set=init_set,
-            quantiles=QUANTILES,
+            quantiles=quantiles,
             hb_regime_aware=bool(args.hb_regime_aware),
             hb_group_shrink_strength=float(max(args.hb_group_shrink_strength, 0.0)),
             hb_item_variance_mode=str(args.hb_item_variance_mode),
@@ -1162,7 +1223,7 @@ def run(args: argparse.Namespace) -> None:
         all_q = _predict_prob_models_once(
             init_set,
             eval_set,
-            quantiles=QUANTILES,
+            quantiles=quantiles,
             hb_group_labels=hb_group_labels,
             hb_bootstrap_draws=max(int(args.hb_bootstrap_draws), 0),
             hb_bootstrap_seed=args.seed,
@@ -1184,7 +1245,7 @@ def run(args: argparse.Namespace) -> None:
             deepar_q = _predict_deepar_fixed(
                 init_set=init_set,
                 eval_set=eval_set,
-                quantiles=QUANTILES,
+                quantiles=quantiles,
                 horizon=args.horizon,
                 input_size=args.input_size,
                 start_padding_enabled=args.start_padding_enabled,
@@ -1195,7 +1256,7 @@ def run(args: argparse.Namespace) -> None:
             drp_q = _predict_deep_renewal_fixed(
                 init_set=init_set,
                 eval_set=eval_set,
-                quantiles=QUANTILES,
+                quantiles=quantiles,
                 horizon=int(args.horizon),
                 context_length=int(args.drp_context_length),
                 num_layers=int(args.drp_num_layers),
@@ -1212,7 +1273,7 @@ def run(args: argparse.Namespace) -> None:
             iets_q = _predict_iets_prob_fixed(
                 init_set=init_set,
                 eval_set=eval_set,
-                quantiles=QUANTILES,
+                quantiles=quantiles,
                 rscript=str(args.iets_rscript),
                 script_path=args.iets_script,
                 seed=int(args.seed),
@@ -1243,7 +1304,7 @@ def run(args: argparse.Namespace) -> None:
                 tsbhb_q = predict_online_tsb_hb(
                     hb_state,
                     frame.target,
-                    quantiles=QUANTILES,
+                    quantiles=quantiles,
                     n_samples=2000,
                     include_hyper_uncertainty=False,
                 )
@@ -1252,7 +1313,7 @@ def run(args: argparse.Namespace) -> None:
                         tsbhb_q[c] = np.nan
                 tsbhb_q = _apply_hb_calibration(
                     tsbhb_q,
-                    quantiles=QUANTILES,
+                    quantiles=quantiles,
                     calibration=hb_calibration,
                 )
                 tsbhb_q["model"] = PROB_TSBHB_MODEL
@@ -1261,7 +1322,7 @@ def run(args: argparse.Namespace) -> None:
                 non_hb_q = _predict_non_hb_prob_models_once(
                     frame.history,
                     frame.target,
-                    quantiles=QUANTILES,
+                    quantiles=quantiles,
                     baseline_mode=baseline_mode,
                     with_tweedie=bool(args.with_tweedie),
                     tweedie_lags=int(max(args.tweedie_lags, 1)),
@@ -1273,7 +1334,7 @@ def run(args: argparse.Namespace) -> None:
                 if args.include_conformal and _include_conformal_prob_baselines(baseline_mode):
                     cp_q = fit_predict_conformal_baselines(
                         frame.history, frame.target,
-                        quantiles=QUANTILES,
+                        quantiles=quantiles,
                         cal_ratio=float(args.conformal_cal_ratio),
                         freq="D",
                     )
@@ -1285,7 +1346,7 @@ def run(args: argparse.Namespace) -> None:
                 step_q = _predict_prob_models_once(
                     frame.history,
                     frame.target,
-                    quantiles=QUANTILES,
+                    quantiles=quantiles,
                     hb_group_labels=hb_group_labels,
                     hb_bootstrap_draws=0,
                     hb_bootstrap_seed=args.seed,
@@ -1318,14 +1379,14 @@ def run(args: argparse.Namespace) -> None:
     if eval_merged.empty:
         raise ValueError("Merged probabilistic evaluation frame is empty; no predictions matched evaluation timestamps.")
 
-    plot_calibration_curve(eval_merged, QUANTILES, out_dir)
-    plot_pit_histogram(eval_merged, QUANTILES, out_dir)
+    plot_calibration_curve(eval_merged, quantiles, out_dir)
+    plot_pit_histogram(eval_merged, quantiles, out_dir)
 
-    pinball_df = evaluate_prob_models(eval_merged, QUANTILES)
+    pinball_df = evaluate_prob_models(eval_merged, quantiles)
     pinball_df.insert(0, "protocol", args.protocol)
     pinball_df.to_csv(out_dir / "prob_pinball.csv", index=False)
     pinball_df.to_csv(out_dir / "probabilistic_forecast_pinball_results.csv", index=False)
-    scaled_pinball_df = _scaled_pinball_table(eval_merged, init_set=init_set, quantiles=QUANTILES)
+    scaled_pinball_df = _scaled_pinball_table(eval_merged, init_set=init_set, quantiles=quantiles)
     if not scaled_pinball_df.empty:
         scaled_pinball_df.insert(0, "protocol", args.protocol)
     scaled_pinball_df.to_csv(out_dir / "prob_pinball_scaled.csv", index=False)
@@ -1351,7 +1412,7 @@ def run(args: argparse.Namespace) -> None:
     coverage_pos_df.insert(0, "protocol", args.protocol)
     coverage_pos_df.to_csv(out_dir / "coverage_summary_positive.csv", index=False)
 
-    pit_df = _pit_long(eval_merged, QUANTILES)
+    pit_df = _pit_long(eval_merged, quantiles)
     pit_df.insert(0, "protocol", args.protocol)
     pit_df.to_csv(out_dir / "pit_values.csv", index=False)
 
@@ -1365,7 +1426,7 @@ def run(args: argparse.Namespace) -> None:
         )
     pinball_pos_mean = pd.DataFrame(columns=["protocol", "model", "pinball_mean_pos"])
     if not eval_pos.empty:
-        pinball_pos_df = evaluate_prob_models(eval_pos, QUANTILES)
+        pinball_pos_df = evaluate_prob_models(eval_pos, quantiles)
         if not pinball_pos_df.empty:
             pinball_pos_df.insert(0, "protocol", args.protocol)
             pinball_pos_mean = pinball_pos_df.groupby(["protocol", "model"], as_index=False)["pinball"].mean().rename(columns={"pinball": "pinball_mean_pos"})
@@ -1381,7 +1442,7 @@ def run(args: argparse.Namespace) -> None:
     _write_prob_slice_metrics(
         init_set=init_set,
         eval_merged=eval_merged,
-        quantiles=QUANTILES,
+        quantiles=quantiles,
         out_dir=out_dir,
         protocol=args.protocol,
     )

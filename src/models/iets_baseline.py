@@ -197,6 +197,7 @@ def fit_predict_iets_prob_panel(
                         occurrence=occurrence,
                         timeout_seconds=timeout_seconds,
                         per_series_timeout_seconds=per_series_timeout_seconds,
+                        quantiles=quantiles,
                     )
                 ] = job_idx
             for future in as_completed(futures):
@@ -227,6 +228,7 @@ def fit_predict_iets_prob_panel(
         occurrence=occurrence,
         timeout_seconds=timeout_seconds,
         per_series_timeout_seconds=per_series_timeout_seconds,
+        quantiles=quantiles,
     )
     out["ds"] = pd.to_datetime(out["ds"])
     for c in qcols:
@@ -251,6 +253,7 @@ def _run_iets_prob_r_script(
     occurrence: str,
     timeout_seconds: int | None,
     per_series_timeout_seconds: int,
+    quantiles: list[float],
 ) -> pd.DataFrame:
     need_train = {"unique_id", "ds", "y"}
     with tempfile.TemporaryDirectory() as tmp:
@@ -270,6 +273,7 @@ def _run_iets_prob_r_script(
             str(int(seed)),
             str(occurrence),
             str(int(max(per_series_timeout_seconds, 1))),
+            ",".join(str(q) for q in quantiles),
         ]
         env = os.environ.copy()
         r_user_lib = find_repo_root() / ".R" / "library"
